@@ -1,6 +1,13 @@
 // Package wrapper implements the gobbler MCP wrapper server that exposes
-// a small tool surface (search_tools, execute_plan, call_raw) to coding
-// harnesses while keeping large intermediate responses shielded internally.
+// a small tool surface to coding harnesses while keeping large intermediate
+// responses shielded internally.
+//
+// The 5 tools are:
+//   - search_tools: discover capabilities across registered servers
+//   - execute_plan: run multi-step plans with response shielding
+//   - call_raw: direct tool call (escape hatch, still shielded)
+//   - inspect_tool: get parameter details for a specific tool
+//   - get_result: paginate through stored results that were truncated
 package wrapper
 
 import (
@@ -15,6 +22,7 @@ import (
 	"github.com/robinwhite/gobbler/internal/logging"
 	"github.com/robinwhite/gobbler/internal/mcpclient"
 	"github.com/robinwhite/gobbler/internal/policy"
+	"github.com/robinwhite/gobbler/internal/resultstore"
 	"github.com/robinwhite/gobbler/pkg/config"
 )
 
@@ -27,6 +35,7 @@ type Server struct {
 	clients   map[string]*mcpclient.Client
 	exec      *executor.Executor
 	enforcer  *policy.Enforcer
+	store     *resultstore.Store
 }
 
 // NewServer creates a new gobbler wrapper MCP server.
@@ -40,18 +49,20 @@ func NewServer(
 	}
 
 	enforcer := policy.NewEnforcer(policyCfg)
-	exec := executor.NewExecutor(clients, enforcer)
+	store := resultstore.New()
+	exec := executor.NewExecutorWithStore(clients, enforcer, store)
 
 	s := &Server{
 		index:    index,
 		clients:  clients,
 		exec:     exec,
 		enforcer: enforcer,
+		store:    store,
 	}
 
 	s.mcpServer = server.NewMCPServer(
 		"gobbler",
-		"0.1.0",
+		"0.2.0",
 		server.WithToolCapabilities(false),
 		server.WithInstructions(gobblerInstructions),
 	)
@@ -92,27 +103,28 @@ func (s *Server) registerTools() {
 	executeTool := mcp.NewTool("execute_plan",
 		mcp.WithDescription(
 			"Execute a structured plan of tool calls against upstream MCP servers. "+
-				"Steps are executed in order. Intermediate results are kept internally -- "+
-				"only the final output is returned. Steps can reference previous step results "+
-				"using ${stepId.field} syntax in arguments. "+
-				"This keeps large API responses from consuming your context."),
+				"Steps are executed in order. Intermediate results are stored internally "+
+				"and only the final output (after shielding) is returned. "+
+				"Steps can reference previous step results using ${stepId.field} syntax. "+
+				"If a result is truncated, the response includes a 'ref' handle and truncation metadata. "+
+				"Use get_result with that ref to page through the full data."),
 		mcp.WithString("plan",
 			mcp.Required(),
 			mcp.Description(
 				"JSON plan object with 'steps' array and optional 'return' spec. "+
 					"Each step: {id, server, tool, arguments}. "+
 					"Return spec: {mode: 'full'|'summary'|'fields', fromStep, fields?}. "+
-					"Example: {\"steps\":[{\"id\":\"s1\",\"server\":\"github-mcp\",\"tool\":\"list_pull_requests\",\"arguments\":{\"owner\":\"org\",\"repo\":\"repo\"}}],\"return\":{\"mode\":\"summary\",\"fromStep\":\"s1\"}}"),
+					"Example: {\"steps\":[{\"id\":\"s1\",\"server\":\"github\",\"tool\":\"list_pull_requests\",\"arguments\":{\"owner\":\"org\",\"repo\":\"repo\"}}],\"return\":{\"mode\":\"summary\",\"fromStep\":\"s1\"}}"),
 		),
 	)
 	s.mcpServer.AddTool(executeTool, s.handleExecutePlan)
 
-	// Tool 3: call_raw (escape hatch / debug)
+	// Tool 3: call_raw (escape hatch)
 	rawTool := mcp.NewTool("call_raw",
 		mcp.WithDescription(
-			"Call a single upstream MCP tool directly and return the shielded result. "+
-				"Use this as an escape hatch when execute_plan is not needed. "+
-				"Output is still subject to response shielding policies."),
+			"Call a single upstream MCP tool directly. The result is shielded and stored. "+
+				"If the response is truncated, a 'ref' handle is returned. "+
+				"Use get_result with that ref to page through the full data."),
 		mcp.WithString("server",
 			mcp.Required(),
 			mcp.Description("Name of the upstream MCP server"),
@@ -144,7 +156,35 @@ func (s *Server) registerTools() {
 	)
 	s.mcpServer.AddTool(inspectTool, s.handleInspectTool)
 
-	log.Info("registered 4 wrapper tools")
+	// Tool 5: get_result (pagination for stored results)
+	getResultTool := mcp.NewTool("get_result",
+		mcp.WithDescription(
+			"Page through a stored result that was truncated. "+
+				"When execute_plan or call_raw returns a truncated response, the output includes "+
+				"a 'ref' handle and metadata (total items, showing count, hasMore). "+
+				"Use this tool with that ref to retrieve the next page, specific array slices, "+
+				"or project specific fields from array elements. "+
+				"Results are held in memory for 10 minutes after creation."),
+		mcp.WithString("ref",
+			mcp.Required(),
+			mcp.Description("Result ref handle from a previous execute_plan or call_raw response (e.g. 'p1:s1', 'raw:3')"),
+		),
+		mcp.WithNumber("offset",
+			mcp.Description("Start index for array pagination (default: 0)"),
+		),
+		mcp.WithNumber("limit",
+			mcp.Description("Number of elements to return (default: 50)"),
+		),
+		mcp.WithString("fields",
+			mcp.Description("Comma-separated list of fields to project from each array element (e.g. 'id,title,state'). Omit to return full elements."),
+		),
+		mcp.WithString("path",
+			mcp.Description("Optional path expression to navigate into the result before slicing (e.g. 'items', 'data.results'). Supports dot notation."),
+		),
+	)
+	s.mcpServer.AddTool(getResultTool, s.handleGetResult)
+
+	log.Info("registered 5 wrapper tools")
 }
 
 func (s *Server) handleSearchTools(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -227,13 +267,8 @@ func (s *Server) handleCallRaw(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError(fmt.Sprintf("call failed: %v", err)), nil
 	}
 
-	switch v := result.(type) {
-	case string:
-		return mcp.NewToolResultText(v), nil
-	default:
-		out, _ := json.MarshalIndent(v, "", "  ")
-		return mcp.NewToolResultText(string(out)), nil
-	}
+	out, _ := json.MarshalIndent(result, "", "  ")
+	return mcp.NewToolResultText(string(out)), nil
 }
 
 func (s *Server) handleInspectTool(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -257,6 +292,135 @@ func (s *Server) handleInspectTool(ctx context.Context, req mcp.CallToolRequest)
 	}
 
 	return mcp.NewToolResultError(fmt.Sprintf("tool %s/%s not found in capability index", serverName, toolName)), nil
+}
+
+func (s *Server) handleGetResult(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	ref, err := req.RequireString("ref")
+	if err != nil {
+		return mcp.NewToolResultError("ref is required"), nil
+	}
+
+	offset := req.GetInt("offset", 0)
+	limit := req.GetInt("limit", 50)
+	fieldsStr := req.GetString("fields", "")
+	pathExpr := req.GetString("path", "")
+
+	// Parse fields
+	var fields []string
+	if fieldsStr != "" {
+		for _, f := range splitFields(fieldsStr) {
+			if f != "" {
+				fields = append(fields, f)
+			}
+		}
+	}
+
+	// If a path is specified, extract that sub-value first, then slice
+	if pathExpr != "" {
+		fullExpr := ref + "." + pathExpr
+		val, err := s.store.ExtractField(fullExpr)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("path extraction failed: %v", err)), nil
+		}
+
+		// If the extracted value is an array, apply offset/limit/fields
+		if arr, ok := val.([]interface{}); ok {
+			return s.sliceAndReturn(arr, ref, offset, limit, fields)
+		}
+
+		// Otherwise return the value directly
+		out, _ := json.MarshalIndent(val, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
+	}
+
+	// Standard slice on the stored result
+	data, meta, err := s.store.Slice(ref, offset, limit, fields)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("get_result failed: %v", err)), nil
+	}
+
+	response := map[string]interface{}{
+		"data": data,
+		"meta": meta,
+	}
+
+	out, _ := json.MarshalIndent(response, "", "  ")
+	return mcp.NewToolResultText(string(out)), nil
+}
+
+// sliceAndReturn applies offset/limit/fields to an already-extracted array.
+func (s *Server) sliceAndReturn(arr []interface{}, ref string, offset, limit int, fields []string) (*mcp.CallToolResult, error) {
+	total := len(arr)
+	if offset >= total {
+		response := map[string]interface{}{
+			"data": []interface{}{},
+			"meta": &resultstore.SliceMeta{
+				Ref:     ref,
+				Total:   total,
+				Offset:  offset,
+				Count:   0,
+				HasMore: false,
+			},
+		}
+		out, _ := json.MarshalIndent(response, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
+	}
+
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	slice := arr[offset:end]
+
+	// Project fields
+	if len(fields) > 0 {
+		projected := make([]interface{}, len(slice))
+		for i, item := range slice {
+			if obj, ok := item.(map[string]interface{}); ok {
+				p := make(map[string]interface{})
+				for _, f := range fields {
+					if v, exists := obj[f]; exists {
+						p[f] = v
+					}
+				}
+				projected[i] = p
+			} else {
+				projected[i] = item
+			}
+		}
+		slice = projected
+	}
+
+	response := map[string]interface{}{
+		"data": slice,
+		"meta": &resultstore.SliceMeta{
+			Ref:     ref,
+			Total:   total,
+			Offset:  offset,
+			Count:   len(slice),
+			HasMore: end < total,
+		},
+	}
+
+	out, _ := json.MarshalIndent(response, "", "  ")
+	return mcp.NewToolResultText(string(out)), nil
+}
+
+func splitFields(s string) []string {
+	var fields []string
+	current := ""
+	for _, c := range s {
+		if c == ',' {
+			fields = append(fields, current)
+			current = ""
+		} else if c != ' ' {
+			current += string(c)
+		}
+	}
+	if current != "" {
+		fields = append(fields, current)
+	}
+	return fields
 }
 
 func joinTags(tags []string) string {
@@ -296,11 +460,14 @@ Instead of calling many individual MCP tools directly, use gobbler's small surfa
 2. execute_plan: Run multi-step plans against upstream tools. Intermediate results stay inside gobbler -- you only see the final output.
 3. call_raw: Call a single tool directly (escape hatch, still shielded).
 4. inspect_tool: Get detailed parameter info for a specific tool.
+5. get_result: Page through stored results when responses are truncated.
 
 Workflow:
 1. Use search_tools to find relevant capabilities.
 2. Use inspect_tool if you need parameter details.
 3. Build a plan with execute_plan for multi-step operations.
 4. Use call_raw for simple one-off calls.
+5. If any response shows "shielded: true" or "hasMore: true", use get_result with the "ref" handle to get the next page.
 
-Plans use step references: arguments can reference previous step results with ${stepId.field} syntax.`
+Plans use step references: arguments can reference previous step results with ${stepId.field} syntax.
+Pagination: get_result supports offset/limit for arrays, field projection via comma-separated fields, and path expressions to navigate into nested objects.`

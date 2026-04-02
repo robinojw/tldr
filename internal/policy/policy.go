@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/robinwhite/gobbler/internal/resultstore"
 	"github.com/robinwhite/gobbler/pkg/config"
 )
 
@@ -44,6 +45,68 @@ func (e *Enforcer) Shield(raw string) string {
 	return raw[:e.cfg.MaxOutputBytes-100] +
 		fmt.Sprintf("\n\n... [truncated: %d bytes total, showing first %d]",
 			len(raw), e.cfg.MaxOutputBytes-100)
+}
+
+// ShieldedResult is the structured output of ShieldStructured.
+// It tells the model exactly what was truncated and provides a ref handle
+// for pagination via get_result.
+type ShieldedResult struct {
+	Data         interface{}            `json:"data"`
+	WasTruncated bool                   `json:"wasTruncated"`
+	Meta         *resultstore.SliceMeta `json:"meta,omitempty"`
+}
+
+// ShieldStructured applies output policy and returns structured metadata
+// about what was truncated. This replaces the string-suffix approach
+// so the model can programmatically decide whether to paginate.
+func (e *Enforcer) ShieldStructured(raw string) *ShieldedResult {
+	if len(raw) <= e.cfg.MaxOutputBytes {
+		return &ShieldedResult{Data: raw, WasTruncated: false}
+	}
+
+	// Try JSON-aware summarization
+	var parsed interface{}
+	if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+		// Check if top-level is an array
+		if arr, ok := parsed.([]interface{}); ok && len(arr) > e.cfg.MaxArrayLength {
+			trimmed := make([]interface{}, e.cfg.MaxArrayLength)
+			for i := 0; i < e.cfg.MaxArrayLength; i++ {
+				trimmed[i] = e.summarizeJSON(arr[i])
+			}
+			data, _ := json.MarshalIndent(trimmed, "", "  ")
+			return &ShieldedResult{
+				Data:         string(data),
+				WasTruncated: true,
+				Meta: &resultstore.SliceMeta{
+					Total:   len(arr),
+					Offset:  0,
+					Count:   e.cfg.MaxArrayLength,
+					HasMore: true,
+				},
+			}
+		}
+
+		// Object or small array -- summarize recursively
+		summarized := e.summarizeJSON(parsed)
+		result, _ := json.MarshalIndent(summarized, "", "  ")
+		s := string(result)
+		if len(s) <= e.cfg.MaxOutputBytes {
+			return &ShieldedResult{Data: s, WasTruncated: false}
+		}
+	}
+
+	// Fall back to byte truncation with structured metadata
+	cut := e.cfg.MaxOutputBytes - 100
+	return &ShieldedResult{
+		Data:         raw[:cut],
+		WasTruncated: true,
+		Meta: &resultstore.SliceMeta{
+			Total:   len(raw),
+			Offset:  0,
+			Count:   cut,
+			HasMore: true,
+		},
+	}
 }
 
 // ShieldJSON applies output policy to a structured value.

@@ -1,16 +1,16 @@
 # Gobbler
 
-Gobbler is a local MCP gateway that sits between your coding harness and your MCP servers. It replaces the full tool surface with 4 compressed wrapper tools. The harness never sees the upstream servers directly.
+Gobbler is a local MCP gateway that sits between your coding harness and your MCP servers. It replaces the full tool surface with 5 wrapper tools. The harness never sees the upstream servers directly.
 
 I built this because MCP tool schemas are expensive. The GitHub MCP server exposes 40+ tools. Each one carries a JSON Schema definition, parameter descriptions, and annotations that get injected into every prompt. The model reads all of it, every time. Cloudflare measured this problem in production and found that collapsing tool surfaces cut their token usage by 81%. Gobbler applies the same compression locally, in a single Go binary, without requiring Cloudflare Workers or TypeScript runtimes.
 
-The second problem is response size. A `list_pull_requests` call can return 500KB of JSON. That entire payload gets dumped into the model's context. Gobbler intercepts it. Arrays get truncated to 50 elements. Strings get capped at 8192 characters. Total output gets clamped to 64KB. The model sees a compressed summary; the raw data stays in gobbler's process memory.
+The second problem is response size. A `list_pull_requests` call can return 500KB of JSON. That entire payload gets dumped into the model's context. Gobbler intercepts it. Arrays get truncated to 50 elements. Strings get capped at 8192 characters. Total output gets clamped to 64KB. But the raw data is not discarded. It stays in gobbler's process memory, addressable by a ref handle. The model can page through truncated results using `get_result` with offset and limit parameters.
 
 ## How the compression works
 
 Without gobbler, every tool definition from every MCP server is injected into the harness prompt. 3 servers with 40 tools each means 120 tool schemas in the system prompt, consuming thousands of tokens before the model does anything useful.
 
-With gobbler, the harness sees exactly 4 tool definitions. The model discovers capabilities by calling `search_tools`, builds execution plans, and gobbler handles the rest.
+With gobbler, the harness sees exactly 5 tool definitions. The model discovers capabilities by calling `search_tools`, builds execution plans, and pages through results as needed.
 
 ```mermaid
 graph LR
@@ -24,16 +24,16 @@ graph LR
 ```mermaid
 graph LR
     subgraph "With Gobbler"
-        H2[Harness] -->|"4 tool schemas<br/>in system prompt"| G[Gobbler]
+        H2[Harness] -->|"5 tool schemas<br/>in system prompt"| G[Gobbler]
         G -->|stdio/http| S4[GitHub MCP]
         G -->|http| S5[Figma MCP]
         G -->|stdio| S6[Tavily MCP]
     end
 ```
 
-The harness prompt shrinks from 120 tool definitions to 4. The model loses nothing because `search_tools` returns exactly the capabilities it needs, on demand, in a compressed format that costs roughly 100 tokens per query.
+The harness prompt shrinks from 120 tool definitions to 5. The model loses nothing because `search_tools` returns exactly the capabilities it needs, on demand, in a compressed format that costs roughly 100 tokens per query.
 
-## The 4 wrapper tools
+## The 5 wrapper tools
 
 `search_tools` takes a query string and searches the compiled capability index. The index contains every upstream tool's name, a 120-character summary, inferred tags, risk classification, and parameter shape. The model uses this to discover what's available without loading full JSON Schemas.
 
@@ -42,6 +42,68 @@ The harness prompt shrinks from 120 tool definitions to 4. The model loses nothi
 `call_raw` calls a single upstream tool directly. It is the escape hatch for one-off calls. Output is still subject to response shielding.
 
 `inspect_tool` returns the full parameter schema for a specific tool when `search_tools` returned enough to identify the right tool but not enough to build arguments.
+
+`get_result` pages through a stored result that was truncated. When `execute_plan` or `call_raw` returns a response with `"shielded": true`, the output includes a ref handle and pagination metadata (total count, offset, hasMore). The model calls `get_result` with that ref, an offset, and a limit to retrieve the next page. It also supports field projection: pass `fields: "id,title,state"` to return only those keys from each array element.
+
+## Result pagination
+
+This is the mechanism that makes shielding lossless. Without it, truncation is data loss. With it, truncation is deferred loading.
+
+Every tool call result -- from `execute_plan` and `call_raw` -- is stored in an in-memory result store keyed by a ref handle. The ref format is `p1:s1` for plan step results or `raw:3` for direct calls. Results persist across plans for 10 minutes (configurable), evicted by TTL or LRU when memory exceeds 128MB.
+
+When the shielding enforcer truncates an array from 200 elements to 50, the response includes structured metadata:
+
+```json
+{
+  "output": "[first 50 elements...]",
+  "ref": "p1:s1",
+  "shielded": true,
+  "meta": {
+    "total": 200,
+    "offset": 0,
+    "count": 50,
+    "hasMore": true
+  }
+}
+```
+
+The model sees 50 elements plus a clear signal that 150 more exist. To get elements 50-99:
+
+```json
+{"ref": "p1:s1", "offset": 50, "limit": 50}
+```
+
+To get only specific fields from elements 100-149:
+
+```json
+{"ref": "p1:s1", "offset": 100, "limit": 50, "fields": "id,title,state"}
+```
+
+To navigate into nested objects before slicing:
+
+```json
+{"ref": "p1:s1", "path": "data.items", "offset": 0, "limit": 25}
+```
+
+The store also supports path expressions in `execute_plan` step references. Within a plan, `${s1[50:100]}` slices elements 50-99 from step s1's result and passes them to the next step's arguments. The full path syntax: `ref.field`, `ref[0].field`, `ref[10:20]`, `ref[10:20].field`, `ref[*].field`.
+
+```mermaid
+sequenceDiagram
+    participant Model
+    participant Gobbler
+    participant Store
+    participant Upstream
+
+    Model->>Gobbler: call_raw(github, list_pull_requests, {owner, repo})
+    Gobbler->>Upstream: list_pull_requests
+    Upstream-->>Gobbler: 200 PRs (500KB)
+    Gobbler->>Store: Store full result as raw:1
+    Gobbler-->>Model: {ref: "raw:1", shielded: true, meta: {total: 200, showing: 50, hasMore: true}}
+    Model->>Gobbler: get_result(ref: "raw:1", offset: 50, limit: 50, fields: "number,title")
+    Gobbler->>Store: Slice raw:1[50:100], project [number, title]
+    Store-->>Gobbler: 50 projected elements
+    Gobbler-->>Model: {data: [...], meta: {total: 200, offset: 50, count: 50, hasMore: true}}
+```
 
 ## Response shielding
 
@@ -59,7 +121,7 @@ flowchart TD
     C -->|Parse fails| I[Truncate raw text at 64KB]
 ```
 
-For `execute_plan`, intermediate step results never leave gobbler. They are stored in an in-memory `resultstore.Store` keyed by step ID. The model can reference them in subsequent steps via `${s1.field}` syntax, but the raw payloads stay inside the Go process. Only the final step's shielded output is returned to the harness.
+For `execute_plan`, intermediate step results never leave gobbler. They are stored in an in-memory `resultstore.Store` keyed by plan-scoped ref handles (`p1:s1`, `p2:s1`). The model can reference them in subsequent steps via `${s1.field}` syntax, and the raw payloads persist across plans for 10 minutes. Only the final step's shielded output is returned to the harness. If the model needs data that was truncated, it calls `get_result` with the ref handle.
 
 ## The migration flow
 
@@ -163,7 +225,7 @@ gobbler install --harness forge
 gobbler install --harness codex
 ```
 
-The harness now sees 4 tools instead of whatever the upstream servers exposed. All tool calls route through `gobbler serve`, which the harness launches automatically via stdio.
+The harness now sees 5 tools instead of whatever the upstream servers exposed. All tool calls route through `gobbler serve`, which the harness launches automatically via stdio.
 
 ## Adding more MCP servers
 
@@ -189,6 +251,7 @@ flowchart TD
         EP[execute_plan]
         CR[call_raw]
         IT[inspect_tool]
+        GR[get_result]
         CI[Capability Index]
         EX[Plan Executor]
         RS[Result Store]
@@ -220,6 +283,10 @@ flowchart TD
 
     M -->|"inspect_tool(server, tool)"| IT
     IT --> CI
+
+    M -->|"get_result(ref, offset, limit)"| GR
+    GR --> RS
+    RS -->|"paginated slice"| M
 ```
 
 The capability compiler runs at `gobbler wrap` time. It connects to each upstream server via MCP, calls `tools/list`, and builds a `CapabilityIndex`. Each tool becomes a `Capability` struct with a 120-character summary, inferred tags, word-level risk classification (`read`, `write`, or `dangerous`), and a parameter shape string. The index is persisted to `~/.config/gobbler/capabilities/`.
@@ -275,7 +342,7 @@ gobbler harness detect                             # detect installed harnesses
 
 ## Project structure
 
-The codebase is 3,988 lines of Go across 28 files. No TypeScript, no containers, no cloud dependencies. 2 direct dependencies: `mark3labs/mcp-go` for MCP protocol plumbing and `spf13/cobra` for CLI parsing.
+The codebase is 5,008 lines of Go across 28 files. No TypeScript, no containers, no cloud dependencies. 2 direct dependencies: `mark3labs/mcp-go` for MCP protocol plumbing and `spf13/cobra` for CLI parsing.
 
 ```
 cmd/gobbler/           CLI entrypoint
@@ -283,7 +350,7 @@ internal/cli/          8 command files wired with cobra
 internal/harness/      Adapter interface + forge/claude/codex implementations
 internal/mcpclient/    MCP client wrapping mcp-go (stdio + HTTP)
 internal/compiler/     Tool schema -> capability index compiler
-internal/wrapper/      MCP wrapper server exposing 4 tools
+internal/wrapper/      MCP wrapper server exposing 5 tools
 internal/executor/     Multi-step plan executor with step references
 internal/policy/       Output shielding: size limits, field filtering, truncation
 internal/resultstore/  In-memory store for intermediate step results
@@ -296,13 +363,13 @@ pkg/protocol/          MCP protocol types and tool schema parsing
 
 ## Tests
 
-17 tests across 4 packages. Run them with:
+26 tests across 4 packages. Run them with:
 
 ```
 go test ./...
 ```
 
-The compiler tests verify tool compilation, capability search, index merging, tag inference, and risk classification. The policy tests verify output shielding for oversized strings, arrays, JSON field filtering, and tool blocking. The registry tests verify CRUD and file persistence. The resultstore tests verify field extraction including nested paths and array indexing.
+The compiler tests verify tool compilation, capability search, index merging, tag inference, and risk classification. The policy tests verify output shielding for oversized strings, arrays, JSON field filtering, and tool blocking. The registry tests verify CRUD and file persistence. The resultstore tests verify pagination with offset/limit, field projection, array slicing, string slicing, plan-scoped refs, TTL eviction, shape analysis, and cross-plan persistence.
 
 ## What this does not do
 
