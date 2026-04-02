@@ -5,6 +5,7 @@ package compiler
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -107,7 +108,10 @@ func Merge(indexes ...*CapabilityIndex) *CapabilityIndex {
 	return merged
 }
 
-// Search finds capabilities matching the given query.
+// Search finds capabilities matching the given query using TF-IDF scoring.
+// Terms are expanded with synonyms (e.g., "find" -> "search", "bugs" -> "issues")
+// before scoring. Each term's contribution is weighted by inverse document
+// frequency: rare terms that appear in fewer capabilities score higher.
 func (idx *CapabilityIndex) Search(query string, limit int) []Capability {
 	if idx.byTerm == nil {
 		idx.buildTermIndex()
@@ -118,19 +122,34 @@ func (idx *CapabilityIndex) Search(query string, limit int) []Capability {
 	}
 
 	terms := tokenize(query)
-	scores := make(map[int]int) // capability index -> match score
+	expanded := expandSynonyms(terms)
 
-	for _, term := range terms {
+	// Total number of capabilities (for IDF calculation)
+	N := float64(len(idx.Capabilities))
+	if N == 0 {
+		return nil
+	}
+
+	scores := make(map[int]float64)
+
+	for _, term := range expanded {
+		// Exact term matches
 		if indices, ok := idx.byTerm[term]; ok {
+			idf := math.Log(1 + N/float64(len(indices)))
 			for _, i := range indices {
-				scores[i]++
+				scores[i] += idf
 			}
 		}
-		// Also check partial matches
+
+		// Partial matches (substring containment) at reduced weight
 		for indexTerm, indices := range idx.byTerm {
+			if indexTerm == term {
+				continue // already scored above
+			}
 			if strings.Contains(indexTerm, term) || strings.Contains(term, indexTerm) {
+				idf := math.Log(1+N/float64(len(indices))) * 0.5
 				for _, i := range indices {
-					scores[i]++
+					scores[i] += idf
 				}
 			}
 		}
@@ -139,7 +158,7 @@ func (idx *CapabilityIndex) Search(query string, limit int) []Capability {
 	// Sort by score descending
 	type scored struct {
 		index int
-		score int
+		score float64
 	}
 	var results []scored
 	for i, s := range scores {
@@ -158,6 +177,51 @@ func (idx *CapabilityIndex) Search(query string, limit int) []Capability {
 		caps[i] = idx.Capabilities[r.index]
 	}
 	return caps
+}
+
+// synonyms maps common query terms to their MCP-tool equivalents.
+// This lets "find open bugs" match tools named "search_issues".
+var synonyms = map[string][]string{
+	"find":         {"search", "list", "get", "query", "lookup", "discover"},
+	"search":       {"find", "list", "get", "query", "lookup", "discover"},
+	"bugs":         {"issues", "errors", "defects"},
+	"issues":       {"bugs", "errors", "tickets", "problems"},
+	"prs":          {"pull", "requests", "merge"},
+	"repos":        {"repositories", "projects"},
+	"repositories": {"repos", "projects"},
+	"remove":       {"delete", "destroy", "drop"},
+	"delete":       {"remove", "destroy", "drop"},
+	"make":         {"create", "add", "new"},
+	"create":       {"make", "add", "new"},
+	"change":       {"update", "modify", "edit", "patch"},
+	"update":       {"change", "modify", "edit", "patch"},
+	"show":         {"get", "read", "view", "display"},
+	"get":          {"show", "read", "fetch", "retrieve"},
+	"files":        {"file", "content", "directory", "path"},
+	"open":         {"active", "pending", "unresolved"},
+	"close":        {"closed", "resolved", "done"},
+}
+
+// expandSynonyms adds synonym terms to the query terms.
+// Each synonym is added once; duplicates are suppressed.
+func expandSynonyms(terms []string) []string {
+	seen := make(map[string]bool)
+	var expanded []string
+	for _, t := range terms {
+		if !seen[t] {
+			seen[t] = true
+			expanded = append(expanded, t)
+		}
+		if syns, ok := synonyms[t]; ok {
+			for _, s := range syns {
+				if !seen[s] {
+					seen[s] = true
+					expanded = append(expanded, s)
+				}
+			}
+		}
+	}
+	return expanded
 }
 
 // ForServer returns all capabilities for a given server name.

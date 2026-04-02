@@ -5,11 +5,17 @@
 // Results persist across plans with TTL-based eviction. Each result is
 // addressable by a ref handle (planID:stepID) so the model can page
 // through truncated data after a plan completes.
+//
+// When a disk path is configured, results are also written to disk and
+// reloaded on startup, surviving process restarts. This matters for
+// stdio-based MCP transports where the harness spawns gobbler per session.
 package resultstore
 
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,6 +38,7 @@ type Store struct {
 	maxBytes   int
 	totalBytes int
 	rawCounter atomic.Int64
+	diskPath   string // if set, results are persisted to/loaded from this directory
 }
 
 // StepResult is the stored result of a single execution step.
@@ -81,6 +88,21 @@ func NewWithConfig(ttl time.Duration, maxBytes int) *Store {
 	}
 }
 
+// NewDiskBacked creates a store that persists results to disk.
+// On creation, it loads any non-expired results from the disk path.
+// Each Put/PutRaw also writes the result to disk.
+func NewDiskBacked(diskPath string) *Store {
+	s := &Store{
+		results:  make(map[string]*StepResult),
+		order:    make([]string, 0),
+		ttl:      DefaultTTL,
+		maxBytes: DefaultMaxStorageBytes,
+		diskPath: diskPath,
+	}
+	s.loadFromDisk()
+	return s
+}
+
 // Put stores a step result with a plan-scoped ref handle.
 func (s *Store) Put(stepID string, result *StepResult) {
 	s.mu.Lock()
@@ -103,6 +125,9 @@ func (s *Store) Put(stepID string, result *StepResult) {
 	s.results[result.Ref] = result
 	s.order = append(s.order, result.Ref)
 	s.totalBytes += result.ByteSize
+
+	// Persist to disk if configured
+	s.writeToDisk(result)
 }
 
 // PutRaw stores a result from a call_raw invocation and returns the ref handle.
@@ -399,6 +424,103 @@ func (s *Store) evictIfNeeded(incoming int) {
 		if r, ok := s.results[oldest]; ok {
 			s.totalBytes -= r.ByteSize
 			delete(s.results, oldest)
+			s.deleteFromDisk(oldest)
+		}
+	}
+}
+
+// --- Disk persistence ---
+
+// refToFilename converts a ref handle to a safe filename.
+// "p1:s1" -> "p1_s1.json", "raw:3" -> "raw_3.json"
+func refToFilename(ref string) string {
+	safe := strings.ReplaceAll(ref, ":", "_")
+	safe = strings.ReplaceAll(safe, "/", "_")
+	return safe + ".json"
+}
+
+// writeToDisk persists a single result to the disk path. Must be called
+// while holding the write lock (or after the result is fully built).
+func (s *Store) writeToDisk(result *StepResult) {
+	if s.diskPath == "" {
+		return
+	}
+
+	if err := os.MkdirAll(s.diskPath, 0755); err != nil {
+		return // best-effort; don't fail the in-memory store
+	}
+
+	data, err := json.Marshal(result)
+	if err != nil {
+		return
+	}
+
+	path := filepath.Join(s.diskPath, refToFilename(result.Ref))
+	_ = os.WriteFile(path, data, 0644)
+}
+
+// deleteFromDisk removes a result file. Best-effort.
+func (s *Store) deleteFromDisk(ref string) {
+	if s.diskPath == "" {
+		return
+	}
+	path := filepath.Join(s.diskPath, refToFilename(ref))
+	_ = os.Remove(path)
+}
+
+// loadFromDisk reads all non-expired result files from the disk path.
+func (s *Store) loadFromDisk() {
+	if s.diskPath == "" {
+		return
+	}
+
+	entries, err := os.ReadDir(s.diskPath)
+	if err != nil {
+		return // directory may not exist yet
+	}
+
+	now := time.Now()
+	loaded := 0
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+			continue
+		}
+
+		path := filepath.Join(s.diskPath, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+
+		var result StepResult
+		if err := json.Unmarshal(data, &result); err != nil {
+			_ = os.Remove(path) // corrupted file
+			continue
+		}
+
+		// Skip expired results
+		if now.After(result.ExpiresAt) {
+			_ = os.Remove(path)
+			continue
+		}
+
+		result.ByteSize = len(result.Raw)
+		result.analyzeShape()
+
+		s.results[result.Ref] = &result
+		s.order = append(s.order, result.Ref)
+		s.totalBytes += result.ByteSize
+		loaded++
+
+		// Track the highest raw counter for PutRaw continuity
+		if strings.HasPrefix(result.Ref, "raw:") {
+			if numStr := strings.TrimPrefix(result.Ref, "raw:"); numStr != "" {
+				if num, err := strconv.ParseInt(numStr, 10, 64); err == nil {
+					if num >= s.rawCounter.Load() {
+						s.rawCounter.Store(num)
+					}
+				}
+			}
 		}
 	}
 }

@@ -12,11 +12,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/robinwhite/gobbler/internal/compiler"
 	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/internal/mcpclient"
 	"github.com/robinwhite/gobbler/internal/policy"
 	"github.com/robinwhite/gobbler/internal/resultstore"
 )
@@ -24,6 +26,12 @@ import (
 var log = logging.New("executor")
 
 var planCounter atomic.Int64
+
+// ToolCaller is the interface for calling tools on upstream MCP servers.
+// mcpclient.Client implements this, and tests can provide mocks.
+type ToolCaller interface {
+	CallTool(ctx context.Context, name string, args map[string]interface{}) (*mcp.CallToolResult, error)
+}
 
 // Plan represents a structured execution plan submitted by the harness.
 type Plan struct {
@@ -37,7 +45,7 @@ type Step struct {
 	Server    string                 `json:"server"`
 	Tool      string                 `json:"tool"`
 	Arguments map[string]interface{} `json:"arguments"`
-	DependsOn string                 `json:"dependsOn,omitempty"` // step ID to wait for
+	DependsOn []string               `json:"dependsOn,omitempty"` // step IDs that must complete first
 }
 
 // ReturnSpec describes what to return from the plan execution.
@@ -69,13 +77,14 @@ type RawResult struct {
 
 // Executor runs plans against upstream MCP servers.
 type Executor struct {
-	clients  map[string]*mcpclient.Client
+	clients  map[string]ToolCaller
 	enforcer *policy.Enforcer
 	store    *resultstore.Store
+	index    *compiler.CapabilityIndex
 }
 
 // NewExecutor creates an executor with the given set of connected MCP clients.
-func NewExecutor(clients map[string]*mcpclient.Client, enforcer *policy.Enforcer) *Executor {
+func NewExecutor(clients map[string]ToolCaller, enforcer *policy.Enforcer) *Executor {
 	return &Executor{
 		clients:  clients,
 		enforcer: enforcer,
@@ -84,12 +93,18 @@ func NewExecutor(clients map[string]*mcpclient.Client, enforcer *policy.Enforcer
 }
 
 // NewExecutorWithStore creates an executor with a shared store instance.
-func NewExecutorWithStore(clients map[string]*mcpclient.Client, enforcer *policy.Enforcer, store *resultstore.Store) *Executor {
+func NewExecutorWithStore(clients map[string]ToolCaller, enforcer *policy.Enforcer, store *resultstore.Store) *Executor {
 	return &Executor{
 		clients:  clients,
 		enforcer: enforcer,
 		store:    store,
 	}
+}
+
+// SetCapabilityIndex sets the capability index used for risk-based policy enforcement.
+// When set, the executor checks tool risk levels against the AllowMutating policy.
+func (e *Executor) SetCapabilityIndex(idx *compiler.CapabilityIndex) {
+	e.index = idx
 }
 
 // Store returns the executor's result store (for the wrapper to expose get_result).
@@ -118,11 +133,16 @@ func (e *Executor) Execute(ctx context.Context, plan Plan) (*Result, error) {
 
 	refs := make(map[string]string) // stepID -> ref handle
 
-	// Execute steps in order
-	for i, step := range plan.Steps {
-		log.Info("executing step %d/%d: %s/%s (plan %s)", i+1, len(plan.Steps), step.Server, step.Tool, planID)
+	// Build dependency graph and execute steps concurrently where possible.
+	// Steps with no unmet dependencies run in parallel; a step waits only
+	// on the steps listed in its DependsOn field.
+	stepErrors := make(map[string]error)
+	completed := make(map[string]bool)
+	completedMu := sync.Mutex{}
+	completedCond := sync.NewCond(&completedMu)
 
-		// Check if tool is blocked
+	// Pre-validate: check blocked/mutating for all steps before executing any
+	for _, step := range plan.Steps {
 		fullName := step.Server + "/" + step.Tool
 		if e.enforcer.IsToolBlocked(fullName) || e.enforcer.IsToolBlocked(step.Tool) {
 			return &Result{
@@ -133,62 +153,175 @@ func (e *Executor) Execute(ctx context.Context, plan Plan) (*Result, error) {
 			}, nil
 		}
 
-		// Resolve argument references from previous steps
-		args, err := e.resolveArgs(step.Arguments)
-		if err != nil {
-			return &Result{
-				Success:  false,
-				PlanID:   planID,
-				Error:    fmt.Sprintf("step %s: failed to resolve arguments: %v", step.ID, err),
-				Duration: time.Since(start),
-			}, nil
+		if !e.enforcer.IsMutatingAllowed() {
+			risk := e.lookupToolRisk(step.Server, step.Tool)
+			if risk == "write" || risk == "dangerous" {
+				return &Result{
+					Success:  false,
+					PlanID:   planID,
+					Error:    fmt.Sprintf("tool %q is %s and mutating is not allowed by policy (set allowMutating: true to permit)", fullName, risk),
+					Duration: time.Since(start),
+				}, nil
+			}
 		}
+	}
 
-		// Get the client for this server
-		client, ok := e.clients[step.Server]
-		if !ok {
-			return &Result{
-				Success:  false,
-				PlanID:   planID,
-				Error:    fmt.Sprintf("step %s: unknown server %q", step.ID, step.Server),
-				Duration: time.Since(start),
-			}, nil
+	// Build step index for dependency lookup
+	stepIndex := make(map[string]int)
+	for i, step := range plan.Steps {
+		stepIndex[step.ID] = i
+	}
+
+	// Validate dependencies exist
+	for _, step := range plan.Steps {
+		for _, dep := range step.DependsOn {
+			if _, ok := stepIndex[dep]; !ok {
+				return &Result{
+					Success: false,
+					PlanID:  planID,
+					Error:   fmt.Sprintf("step %q depends on unknown step %q", step.ID, dep),
+					Duration: time.Since(start),
+				}, nil
+			}
 		}
+	}
 
-		// Set step timeout
-		stepTimeout := time.Duration(e.enforcer.StepTimeout()) * time.Second
-		stepCtx, stepCancel := context.WithTimeout(ctx, stepTimeout)
+	// Execute steps with dependency-aware concurrency
+	var wg sync.WaitGroup
+	var firstErr error
+	var firstErrMu sync.Mutex
 
-		stepStart := time.Now()
-		result, err := client.CallTool(stepCtx, step.Tool, args)
-		stepCancel()
+	for i := range plan.Steps {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			step := plan.Steps[idx]
 
-		if err != nil {
-			return &Result{
-				Success:   false,
+			// Wait for dependencies to complete
+			completedMu.Lock()
+			for {
+				allDone := true
+				for _, dep := range step.DependsOn {
+					if !completed[dep] {
+						allDone = false
+						break
+					}
+					// If a dependency failed, abort
+					if stepErrors[dep] != nil {
+						completedMu.Unlock()
+						return
+					}
+				}
+				if allDone {
+					break
+				}
+				completedCond.Wait()
+			}
+			completedMu.Unlock()
+
+			// Check if any earlier step has failed (early exit)
+			firstErrMu.Lock()
+			if firstErr != nil {
+				firstErrMu.Unlock()
+				return
+			}
+			firstErrMu.Unlock()
+
+			log.Info("executing step %s: %s/%s (plan %s)", step.ID, step.Server, step.Tool, planID)
+
+			// Resolve argument references from previous steps
+			args, err := e.resolveArgs(step.Arguments)
+			if err != nil {
+				firstErrMu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("step %s: failed to resolve arguments: %v", step.ID, err)
+				}
+				firstErrMu.Unlock()
+				completedMu.Lock()
+				stepErrors[step.ID] = err
+				completed[step.ID] = true
+				completedCond.Broadcast()
+				completedMu.Unlock()
+				return
+			}
+
+			// Get the client for this server
+			client, ok := e.clients[step.Server]
+			if !ok {
+				err := fmt.Errorf("step %s: unknown server %q", step.ID, step.Server)
+				firstErrMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				firstErrMu.Unlock()
+				completedMu.Lock()
+				stepErrors[step.ID] = err
+				completed[step.ID] = true
+				completedCond.Broadcast()
+				completedMu.Unlock()
+				return
+			}
+
+			// Set step timeout
+			stepTimeout := time.Duration(e.enforcer.StepTimeout()) * time.Second
+			stepCtx, stepCancel := context.WithTimeout(ctx, stepTimeout)
+			defer stepCancel()
+
+			stepStart := time.Now()
+			result, err := client.CallTool(stepCtx, step.Tool, args)
+
+			if err != nil {
+				firstErrMu.Lock()
+				if firstErr == nil {
+					firstErr = fmt.Errorf("step %s: %v", step.ID, err)
+				}
+				firstErrMu.Unlock()
+				completedMu.Lock()
+				stepErrors[step.ID] = err
+				completed[step.ID] = true
+				completedCond.Broadcast()
+				completedMu.Unlock()
+				return
+			}
+
+			// Store the raw result with plan-scoped ref.
+			// Extract the text content from the MCP response so that
+			// ${stepId.field} references operate on the tool's payload,
+			// not the MCP wrapper structure.
+			rawBytes := extractContent(result)
+			stepResult := &resultstore.StepResult{
 				PlanID:    planID,
-				StepCount: i + 1,
-				Error:     fmt.Sprintf("step %s: %v", step.ID, err),
-				Duration:  time.Since(start),
-			}, nil
-		}
+				StepID:    step.ID,
+				Server:    step.Server,
+				Tool:      step.Tool,
+				Raw:       rawBytes,
+				IsError:   result.IsError,
+				Timestamp: time.Now(),
+				Duration:  time.Since(stepStart),
+			}
+			e.store.Put(step.ID, stepResult)
 
-		// Store the raw result with plan-scoped ref
-		rawBytes, _ := json.Marshal(result)
-		stepResult := &resultstore.StepResult{
+			completedMu.Lock()
+			refs[step.ID] = stepResult.Ref
+			completed[step.ID] = true
+			completedCond.Broadcast()
+			completedMu.Unlock()
+
+			log.Info("step %s stored as %s (%d bytes, %v)", step.ID, stepResult.Ref, len(rawBytes), time.Since(stepStart))
+		}(i)
+	}
+
+	wg.Wait()
+
+	if firstErr != nil {
+		return &Result{
+			Success:   false,
 			PlanID:    planID,
-			StepID:    step.ID,
-			Server:    step.Server,
-			Tool:      step.Tool,
-			Raw:       rawBytes,
-			IsError:   result.IsError,
-			Timestamp: time.Now(),
-			Duration:  time.Since(stepStart),
-		}
-		e.store.Put(step.ID, stepResult)
-		refs[step.ID] = stepResult.Ref
-
-		log.Info("step %s stored as %s (%d bytes, %v)", step.ID, stepResult.Ref, len(rawBytes), time.Since(stepStart))
+			StepCount: len(completed),
+			Error:     firstErr.Error(),
+			Duration:  time.Since(start),
+			Refs:      refs,
+		}, nil
 	}
 
 	// Build the output based on the return spec
@@ -219,6 +352,20 @@ func (e *Executor) Execute(ctx context.Context, plan Plan) (*Result, error) {
 // CallRaw executes a single raw tool call and stores the result.
 // Returns the shielded output and a ref handle for pagination.
 func (e *Executor) CallRaw(ctx context.Context, server, tool string, args map[string]interface{}) (*RawResult, error) {
+	// Check if tool is blocked
+	fullName := server + "/" + tool
+	if e.enforcer.IsToolBlocked(fullName) || e.enforcer.IsToolBlocked(tool) {
+		return nil, fmt.Errorf("tool %q is blocked by policy", fullName)
+	}
+
+	// Enforce mutating policy
+	if !e.enforcer.IsMutatingAllowed() {
+		risk := e.lookupToolRisk(server, tool)
+		if risk == "write" || risk == "dangerous" {
+			return nil, fmt.Errorf("tool %q is %s and mutating is not allowed by policy", fullName, risk)
+		}
+	}
+
 	client, ok := e.clients[server]
 	if !ok {
 		return nil, fmt.Errorf("unknown server %q", server)
@@ -230,7 +377,7 @@ func (e *Executor) CallRaw(ctx context.Context, server, tool string, args map[st
 	}
 
 	// Store the raw result so it's pageable
-	rawBytes, _ := json.Marshal(result)
+	rawBytes := extractContent(result)
 	ref := e.store.PutRaw(server, tool, rawBytes)
 
 	// Shield for immediate output
@@ -322,4 +469,58 @@ func (e *Executor) buildOutput(plan Plan, planID string) (interface{}, error) {
 	default:
 		return e.enforcer.Shield(string(stepResult.Raw)), nil
 	}
+}
+
+// lookupToolRisk returns the risk level ("read", "write", "dangerous") for a tool.
+// Falls back to name-based heuristic if no capability index is available.
+func (e *Executor) lookupToolRisk(server, tool string) string {
+	if e.index != nil {
+		caps := e.index.ForServer(server)
+		for _, cap := range caps {
+			if cap.ToolName == tool {
+				return cap.RiskLevel
+			}
+		}
+	}
+
+	// Heuristic fallback: use tool name keywords
+	lower := strings.ToLower(tool)
+	for _, w := range []string{"delete", "remove", "destroy", "drop", "purge"} {
+		if strings.Contains(lower, w) {
+			return "dangerous"
+		}
+	}
+	for _, w := range []string{"create", "update", "set", "add", "edit", "modify", "write", "push", "merge", "post", "put", "patch"} {
+		if strings.Contains(lower, w) {
+			return "write"
+		}
+	}
+	return "read"
+}
+
+// extractContent pulls the text payload from an MCP CallToolResult.
+// If the first content piece is text and parses as JSON, store that JSON directly.
+// Otherwise, fall back to marshaling the entire MCP result.
+func extractContent(result *mcp.CallToolResult) json.RawMessage {
+	if result == nil {
+		return []byte("{}")
+	}
+
+	// Try to extract text content from the first piece
+	for _, c := range result.Content {
+		if tc, ok := c.(mcp.TextContent); ok {
+			text := tc.Text
+			// If it's valid JSON, store it as-is (most MCP tools return JSON text)
+			if json.Valid([]byte(text)) {
+				return json.RawMessage(text)
+			}
+			// If it's plain text, wrap it as a JSON string
+			quoted, _ := json.Marshal(text)
+			return json.RawMessage(quoted)
+		}
+	}
+
+	// Fallback: marshal the whole result
+	b, _ := json.Marshal(result)
+	return json.RawMessage(b)
 }

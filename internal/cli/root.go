@@ -28,11 +28,12 @@ by replacing many upstream MCP tools with a small wrapper surface and prevents
 large intermediate API responses from reaching the model.
 
 Instead of exposing dozens of MCP tools directly to your coding harness (Claude Code,
-ForgeCode, Codex), gobbler sits in between and provides just 4 tools:
+ForgeCode, Codex), gobbler sits in between and provides 5 tools:
   - search_tools: discover capabilities across all registered servers
   - execute_plan: run multi-step plans with response shielding  
   - call_raw: direct tool calls (escape hatch)
-  - inspect_tool: get parameter details for a specific tool`,
+  - inspect_tool: get parameter details for a specific tool
+  - get_result: page through truncated results`,
 	}
 
 	root.AddCommand(

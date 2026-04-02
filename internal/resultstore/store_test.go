@@ -2,6 +2,7 @@ package resultstore
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 	"time"
 )
@@ -358,5 +359,81 @@ func TestResultsPersistAcrossPlans(t *testing.T) {
 	}
 	if r2.PlanID != "plan2" {
 		t.Errorf("expected planID=plan2, got %s", r2.PlanID)
+	}
+}
+
+func TestDiskPersistence(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a disk-backed store and put some data
+	s1 := NewDiskBacked(dir)
+
+	raw1, _ := json.Marshal(map[string]interface{}{"title": "Issue 1", "number": 1})
+	s1.Put("s1", &StepResult{PlanID: "p1", StepID: "s1", Server: "github", Tool: "get_issue", Raw: raw1})
+
+	raw2, _ := json.Marshal([]int{1, 2, 3, 4, 5})
+	ref := s1.PutRaw("test", "list", raw2)
+
+	// Verify data is on disk
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Errorf("expected 2 files on disk, got %d", len(entries))
+	}
+
+	// Create a new store from the same path -- should reload
+	s2 := NewDiskBacked(dir)
+
+	r, ok := s2.Get("p1:s1")
+	if !ok {
+		t.Fatal("expected p1:s1 to be loaded from disk")
+	}
+	if r.Server != "github" {
+		t.Errorf("expected server=github, got %s", r.Server)
+	}
+	if r.Tool != "get_issue" {
+		t.Errorf("expected tool=get_issue, got %s", r.Tool)
+	}
+
+	// Raw result should also be loaded
+	r2, ok := s2.Get(ref)
+	if !ok {
+		t.Fatalf("expected %s to be loaded from disk", ref)
+	}
+	if !r2.IsArray || r2.ArrayLen != 5 {
+		t.Errorf("expected reloaded result to be array of 5, got isArray=%v arrayLen=%d", r2.IsArray, r2.ArrayLen)
+	}
+}
+
+func TestDiskPersistenceExpiry(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a store with very short TTL
+	s1 := &Store{
+		results:  make(map[string]*StepResult),
+		order:    make([]string, 0),
+		ttl:      1 * time.Millisecond,
+		maxBytes: DefaultMaxStorageBytes,
+		diskPath: dir,
+	}
+
+	raw, _ := json.Marshal("test")
+	s1.Put("s1", &StepResult{StepID: "s1", Raw: raw})
+
+	// Wait for TTL
+	time.Sleep(5 * time.Millisecond)
+
+	// Reload: expired results should be skipped and cleaned up
+	s2 := NewDiskBacked(dir)
+	if _, ok := s2.Get("s1"); ok {
+		t.Error("expected expired result to not be loaded from disk")
+	}
+
+	// File should have been cleaned up
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 0 {
+		t.Errorf("expected expired files to be cleaned up, got %d files", len(entries))
 	}
 }

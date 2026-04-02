@@ -147,3 +147,76 @@ func TestInferTags(t *testing.T) {
 		t.Error("expected 'github' tag")
 	}
 }
+
+func TestSearchSynonyms(t *testing.T) {
+	tools := []mcp.Tool{
+		mcp.NewTool("search_issues",
+			mcp.WithDescription("Search for issues in GitHub repositories"),
+		),
+		mcp.NewTool("list_pull_requests",
+			mcp.WithDescription("List pull requests in a GitHub repository"),
+		),
+		mcp.NewTool("create_issue",
+			mcp.WithDescription("Create a new issue in a GitHub repository"),
+		),
+		mcp.NewTool("get_file_contents",
+			mcp.WithDescription("Get the contents of a file from a repository"),
+		),
+	}
+
+	idx := Compile("github", tools)
+
+	// "find open bugs" should match search_issues via synonym expansion:
+	//   find -> search, list, get, query, lookup, discover
+	//   bugs -> issues, errors, defects
+	results := idx.Search("find open bugs", 10)
+	if len(results) == 0 {
+		t.Fatal("expected results for 'find open bugs'")
+	}
+
+	// search_issues should rank highest because "find" expands to "search"
+	// and "bugs" expands to "issues"
+	found := false
+	for _, r := range results[:min(3, len(results))] {
+		if r.ToolName == "search_issues" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		names := make([]string, len(results))
+		for i, r := range results {
+			names[i] = r.ToolName
+		}
+		t.Errorf("expected search_issues in top 3 results for 'find open bugs', got %v", names)
+	}
+}
+
+func TestSearchTFIDF(t *testing.T) {
+	// Build an index where "search" appears in many tools but "tavily" is unique
+	tools := []mcp.Tool{
+		mcp.NewTool("search_code", mcp.WithDescription("Search for code")),
+		mcp.NewTool("search_issues", mcp.WithDescription("Search for issues")),
+		mcp.NewTool("search_repos", mcp.WithDescription("Search for repos")),
+		mcp.NewTool("tavily_search", mcp.WithDescription("Search the web using Tavily")),
+	}
+
+	idx := Compile("test", tools)
+
+	// A query for "tavily" should rank tavily_search first because
+	// "tavily" is a rare term (appears in 1 out of 4) so has high IDF
+	results := idx.Search("tavily", 10)
+	if len(results) == 0 {
+		t.Fatal("expected results for 'tavily'")
+	}
+	if results[0].ToolName != "tavily_search" {
+		t.Errorf("expected tavily_search as top result, got %s", results[0].ToolName)
+	}
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

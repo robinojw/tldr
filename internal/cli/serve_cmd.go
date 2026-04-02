@@ -3,12 +3,14 @@ package cli
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 
 	"github.com/robinwhite/gobbler/internal/compiler"
 	"github.com/robinwhite/gobbler/internal/logging"
 	"github.com/robinwhite/gobbler/internal/mcpclient"
 	"github.com/robinwhite/gobbler/internal/registry"
 	"github.com/robinwhite/gobbler/internal/wrapper"
+	"github.com/robinwhite/gobbler/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -90,7 +92,8 @@ and internally connects to all registered upstream MCP servers.`,
 
 			// Create and start wrapper server
 			policyCfg := reg.Policy()
-			srv := wrapper.NewServer(merged, clients, policyCfg)
+			diskPath := filepath.Join(config.GobblerDir(), "results")
+			srv := wrapper.NewServer(merged, clients, policyCfg, diskPath)
 
 			// Clean up clients on exit
 			defer func() {

@@ -39,18 +39,33 @@ type Server struct {
 }
 
 // NewServer creates a new gobbler wrapper MCP server.
+// If diskPath is non-empty, results are persisted to disk and survive restarts.
 func NewServer(
 	index *compiler.CapabilityIndex,
 	clients map[string]*mcpclient.Client,
 	policyCfg *config.PolicyConfig,
+	diskPath string,
 ) *Server {
 	if policyCfg == nil {
 		policyCfg = config.DefaultPolicyConfig()
 	}
 
 	enforcer := policy.NewEnforcer(policyCfg)
-	store := resultstore.New()
-	exec := executor.NewExecutorWithStore(clients, enforcer, store)
+	var store *resultstore.Store
+	if diskPath != "" {
+		store = resultstore.NewDiskBacked(diskPath)
+	} else {
+		store = resultstore.New()
+	}
+
+	// Convert concrete clients to ToolCaller interface
+	callers := make(map[string]executor.ToolCaller, len(clients))
+	for name, c := range clients {
+		callers[name] = c
+	}
+
+	exec := executor.NewExecutorWithStore(callers, enforcer, store)
+	exec.SetCapabilityIndex(index)
 
 	s := &Server{
 		index:    index,
@@ -103,16 +118,16 @@ func (s *Server) registerTools() {
 	executeTool := mcp.NewTool("execute_plan",
 		mcp.WithDescription(
 			"Execute a structured plan of tool calls against upstream MCP servers. "+
-				"Steps are executed in order. Intermediate results are stored internally "+
-				"and only the final output (after shielding) is returned. "+
+				"Steps are executed in dependency order (concurrently when possible). "+
+				"Intermediate results are stored internally and only the final output (after shielding) is returned. "+
 				"Steps can reference previous step results using ${stepId.field} syntax. "+
 				"If a result is truncated, the response includes a 'ref' handle and truncation metadata. "+
 				"Use get_result with that ref to page through the full data."),
-		mcp.WithString("plan",
+		mcp.WithObject("plan",
 			mcp.Required(),
 			mcp.Description(
-				"JSON plan object with 'steps' array and optional 'return' spec. "+
-					"Each step: {id, server, tool, arguments}. "+
+				"Plan object with 'steps' array and optional 'return' spec. "+
+					"Each step: {id, server, tool, arguments, dependsOn?: [stepIds]}. "+
 					"Return spec: {mode: 'full'|'summary'|'fields', fromStep, fields?}. "+
 					"Example: {\"steps\":[{\"id\":\"s1\",\"server\":\"github\",\"tool\":\"list_pull_requests\",\"arguments\":{\"owner\":\"org\",\"repo\":\"repo\"}}],\"return\":{\"mode\":\"summary\",\"fromStep\":\"s1\"}}"),
 		),
@@ -133,8 +148,8 @@ func (s *Server) registerTools() {
 			mcp.Required(),
 			mcp.Description("Name of the tool to call"),
 		),
-		mcp.WithString("arguments",
-			mcp.Description("JSON object of tool arguments"),
+		mcp.WithObject("arguments",
+			mcp.Description("Tool arguments as a JSON object"),
 		),
 	)
 	s.mcpServer.AddTool(rawTool, s.handleCallRaw)
@@ -221,14 +236,32 @@ func (s *Server) handleSearchTools(ctx context.Context, req mcp.CallToolRequest)
 }
 
 func (s *Server) handleExecutePlan(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	planJSON, err := req.RequireString("plan")
-	if err != nil {
+	// plan comes as a structured JSON object (not a string) from the MCP layer.
+	// The model sends {"plan": {"steps": [...], "return": {...}}} directly.
+	planRaw, ok := req.GetArguments()["plan"]
+	if !ok {
 		return mcp.NewToolResultError("plan is required"), nil
 	}
 
+	// Re-marshal and unmarshal to get the typed Plan struct.
+	// This handles both the object case (MCP sends a map) and the legacy
+	// string case (in case a client sends a JSON string).
 	var plan executor.Plan
-	if err := json.Unmarshal([]byte(planJSON), &plan); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("invalid plan JSON: %v", err)), nil
+	switch v := planRaw.(type) {
+	case string:
+		// Legacy: some clients may still send a JSON string
+		if err := json.Unmarshal([]byte(v), &plan); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid plan JSON string: %v", err)), nil
+		}
+	default:
+		// Standard: plan is a structured object from the MCP transport
+		planBytes, err := json.Marshal(v)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("failed to serialize plan: %v", err)), nil
+		}
+		if err := json.Unmarshal(planBytes, &plan); err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("invalid plan structure: %v", err)), nil
+		}
 	}
 
 	result, err := s.exec.Execute(ctx, plan)
@@ -240,7 +273,6 @@ func (s *Server) handleExecutePlan(ctx context.Context, req mcp.CallToolRequest)
 		return mcp.NewToolResultError(fmt.Sprintf("plan failed at step %d: %s", result.StepCount, result.Error)), nil
 	}
 
-	// Serialize the output
 	outBytes, _ := json.MarshalIndent(result, "", "  ")
 	return mcp.NewToolResultText(string(outBytes)), nil
 }
@@ -256,10 +288,24 @@ func (s *Server) handleCallRaw(ctx context.Context, req mcp.CallToolRequest) (*m
 		return mcp.NewToolResultError("tool is required"), nil
 	}
 
-	argsJSON := req.GetString("arguments", "{}")
-	var args map[string]interface{}
-	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("invalid arguments JSON: %v", err)), nil
+	// arguments comes as a structured object or a legacy JSON string
+	args := make(map[string]interface{})
+	if argsRaw, ok := req.GetArguments()["arguments"]; ok {
+		switch v := argsRaw.(type) {
+		case string:
+			// Legacy: client sends a JSON string
+			if err := json.Unmarshal([]byte(v), &args); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid arguments JSON: %v", err)), nil
+			}
+		case map[string]interface{}:
+			args = v
+		default:
+			// Marshal/unmarshal roundtrip for other types
+			b, _ := json.Marshal(v)
+			if err := json.Unmarshal(b, &args); err != nil {
+				return mcp.NewToolResultError(fmt.Sprintf("invalid arguments: %v", err)), nil
+			}
+		}
 	}
 
 	result, err := s.exec.CallRaw(ctx, serverName, toolName, args)
