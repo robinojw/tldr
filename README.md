@@ -1,64 +1,158 @@
 # Gobbler
 
-Gobbler is a local MCP gateway written in Go. It sits between your coding harness (Claude Code, ForgeCode, Codex) and your MCP servers, replacing their full tool schemas with 4 compressed wrapper tools. The harness never sees the upstream servers directly. Gobbler handles discovery, orchestration, and response shielding internally.
+Gobbler is a local MCP gateway that sits between your coding harness and your MCP servers. It replaces the full tool surface with 4 compressed wrapper tools. The harness never sees the upstream servers directly.
 
-I built this because MCP tool schemas are expensive. The GitHub MCP server alone exposes 40+ tools. Each tool definition, with its JSON Schema and description, gets injected into every prompt. Cloudflare measured this problem and found that collapsing tool surfaces cut their token usage by 81%. Gobbler applies the same principle locally without requiring Cloudflare Workers, TypeScript, or V8 isolates.
+I built this because MCP tool schemas are expensive. The GitHub MCP server exposes 40+ tools. Each one carries a JSON Schema definition, parameter descriptions, and annotations that get injected into every prompt. The model reads all of it, every time. Cloudflare measured this problem in production and found that collapsing tool surfaces cut their token usage by 81%. Gobbler applies the same compression locally, in a single Go binary, without requiring Cloudflare Workers or TypeScript runtimes.
 
-## What it actually does
+The second problem is response size. A `list_pull_requests` call can return 500KB of JSON. That entire payload gets dumped into the model's context. Gobbler intercepts it. Arrays get truncated to 50 elements. Strings get capped at 8192 characters. Total output gets clamped to 64KB. The model sees a compressed summary; the raw data stays in gobbler's process memory.
 
-Gobbler exposes exactly 4 tools to the harness:
+## How the compression works
 
-`search_tools` takes a query string and returns compressed capability summaries from all registered upstream servers. The harness uses this to discover what's available without loading full JSON Schemas.
+Without gobbler, every tool definition from every MCP server is injected into the harness prompt. 3 servers with 40 tools each means 120 tool schemas in the system prompt, consuming thousands of tokens before the model does anything useful.
 
-`execute_plan` takes a JSON plan with ordered steps. Each step names a server, tool, and arguments. Gobbler executes the steps internally, stores intermediate results in memory, and returns only the final output after applying size limits. The harness never sees the raw intermediate payloads. Step arguments can reference previous results using `${stepId.field}` syntax.
+With gobbler, the harness sees exactly 4 tool definitions. The model discovers capabilities by calling `search_tools`, builds execution plans, and gobbler handles the rest.
 
-`call_raw` is the escape hatch. It calls a single upstream tool and returns the result, still subject to output shielding.
+```mermaid
+graph LR
+    subgraph "Without Gobbler"
+        H1[Harness] -->|"120 tool schemas<br/>in system prompt"| S1[GitHub MCP]
+        H1 --> S2[Figma MCP]
+        H1 --> S3[Tavily MCP]
+    end
+```
 
-`inspect_tool` returns the full parameter schema for a specific tool when the model needs more detail before building a plan.
+```mermaid
+graph LR
+    subgraph "With Gobbler"
+        H2[Harness] -->|"4 tool schemas<br/>in system prompt"| G[Gobbler]
+        G -->|stdio/http| S4[GitHub MCP]
+        G -->|http| S5[Figma MCP]
+        G -->|stdio| S6[Tavily MCP]
+    end
+```
+
+The harness prompt shrinks from 120 tool definitions to 4. The model loses nothing because `search_tools` returns exactly the capabilities it needs, on demand, in a compressed format that costs roughly 100 tokens per query.
+
+## The 4 wrapper tools
+
+`search_tools` takes a query string and searches the compiled capability index. The index contains every upstream tool's name, a 120-character summary, inferred tags, risk classification, and parameter shape. The model uses this to discover what's available without loading full JSON Schemas.
+
+`execute_plan` takes a JSON plan with ordered steps. Each step names a server, tool, and arguments. Gobbler executes them sequentially, stores intermediate results in memory, and returns only the final output after applying size limits. Step arguments can reference previous results using `${stepId.field}` syntax.
+
+`call_raw` calls a single upstream tool directly. It is the escape hatch for one-off calls. Output is still subject to response shielding.
+
+`inspect_tool` returns the full parameter schema for a specific tool when `search_tools` returned enough to identify the right tool but not enough to build arguments.
 
 ## Response shielding
 
-This is the part that matters beyond schema compression. When an upstream tool returns a 500KB JSON blob, Gobbler does not forward it to the harness. The output policy enforcer truncates arrays to 50 elements, strings to 8192 characters, and total output to 64KB. Field filtering lets the model request only specific keys from a result. These limits are configurable in the policy config.
+Every response that crosses the boundary from gobbler back to the harness passes through the output policy enforcer. The enforcer applies 3 transformations:
 
-The mechanism is straightforward. Every `execute_plan` invocation writes each step's raw result into an in-memory `resultstore.Store`. Only the final step's output, after policy enforcement, crosses the boundary back to the harness. The intermediate data stays inside the Go process.
+```mermaid
+flowchart TD
+    A[Upstream MCP Response] --> B{Size > 64KB?}
+    B -->|No| F[Return as-is]
+    B -->|Yes| C[Parse as JSON]
+    C --> D[Truncate arrays to 50 elements]
+    D --> E[Cap strings at 8192 chars]
+    E --> G[Clamp total to 64KB]
+    G --> H[Return shielded result]
+    C -->|Parse fails| I[Truncate raw text at 64KB]
+```
 
-## The compiler
+For `execute_plan`, intermediate step results never leave gobbler. They are stored in an in-memory `resultstore.Store` keyed by step ID. The model can reference them in subsequent steps via `${s1.field}` syntax, but the raw payloads stay inside the Go process. Only the final step's shielded output is returned to the harness.
 
-The capability compiler is where token savings actually happen. For each upstream server, Gobbler connects via MCP, calls `tools/list`, and builds a `CapabilityIndex`. Each tool becomes a `Capability` struct: server name, tool name, a 120-character summary, inferred tags, risk level, and a short input shape description.
+## The migration flow
 
-Risk classification uses word-level matching against tool names and descriptions. Words like `delete`, `remove`, and `destroy` produce a "dangerous" classification. Words like `create`, `update`, and `push` produce "write". Everything else defaults to "read". MCP's default annotations (which mark every tool as `DestructiveHint: true`) are ignored because they carry no signal.
+```mermaid
+sequenceDiagram
+    participant User
+    participant Gobbler
+    participant Harness Config
+    participant Backup
 
-The compiler estimates token savings using a 4-characters-per-token heuristic. In tests with 4 GitHub-style tools, raw schema JSON consumed ~377 tokens. The compiled capability index for the same tools consumed ~266 tokens. The real savings scale with tool count because the wrapper's 4-tool surface stays fixed regardless of how many upstream tools exist.
+    User->>Gobbler: gobbler migrate
+    Gobbler->>Harness Config: Read .mcp.json
+    Harness Config-->>Gobbler: {github: {...}, figma: {...}, tavily: {...}}
+    Gobbler->>Backup: Backup original config
+    Gobbler->>Gobbler: Import servers into registry
+    Gobbler->>Harness Config: Rewrite with {gobbler: {command: "gobbler", args: ["serve"]}}
+    Gobbler-->>User: Migrated 3 servers. Config backed up.
+```
 
-## Harness adapters
+`gobbler migrate` reads the existing `.mcp.json` from each detected harness, imports every MCP server entry into gobbler's registry, backs up the original config, and rewrites it with a single `gobbler` entry. One command replaces the entire MCP setup.
 
-Gobbler supports 3 harnesses through a shared `Adapter` interface:
+## Install
 
-**ForgeCode** reads and writes `.mcp.json` at user (`~/.forge/.mcp.json`) and local (cwd) scopes. The adapter detects the `forge` binary or config directory, injects a single `gobbler` entry pointing to `gobbler serve`, and calls `forge mcp reload` after installation.
+The install script detects your OS and architecture, downloads the latest release binary, and places it in `/usr/local/bin`. If no release exists yet, it falls back to building from source (requires Go 1.22+).
 
-**Claude Code** uses `.mcp.json` at the project root. The adapter detects the `claude` binary or `~/.claude.json`. Claude Code has no reload command, so the user restarts their session after installation.
+```
+curl -sSfL https://raw.githubusercontent.com/robinojw/gobbler/main/install.sh | sh
+```
 
-**Codex** uses the same `.mcp.json` format for compatibility. The adapter detects the `codex` binary or `~/.codex` directory.
-
-Each adapter backs up the existing config before modification. `gobbler rollback --harness <name>` restores from the latest backup.
-
-## Installation and usage
+Or install directly with Go:
 
 ```
 go install github.com/robinwhite/gobbler/cmd/gobbler@latest
 ```
 
-Register an upstream MCP server:
+Or clone and build:
 
 ```
-gobbler mcp add --transport stdio github-mcp npx -y @modelcontextprotocol/server-github
+git clone https://github.com/robinojw/gobbler.git
+cd gobbler
+go build -o gobbler ./cmd/gobbler
+sudo mv gobbler /usr/local/bin/
+```
+
+## Quick start: one-command migration
+
+If you already have MCP servers configured in Claude Code, ForgeCode, or Codex, this is the fastest path.
+
+```
+gobbler migrate
+```
+
+That command detects every installed harness, reads its `.mcp.json`, imports all servers into gobbler's registry, backs up the original config, and rewrites each harness to point only at gobbler. The `--dry-run` flag shows what would happen without making changes:
+
+```
+gobbler migrate --dry-run
+```
+
+To migrate a single harness:
+
+```
+gobbler migrate --harness claude
+```
+
+Verify the migration:
+
+```
+gobbler mcp list
+gobbler doctor
+```
+
+Roll back any harness to its pre-gobbler config:
+
+```
+gobbler rollback --harness claude
+```
+
+## Manual setup
+
+If you prefer to set things up piece by piece.
+
+Register upstream MCP servers:
+
+```
+gobbler mcp add --transport stdio github npx -y @modelcontextprotocol/server-github
 gobbler mcp add --transport http figma https://mcp.figma.com/mcp
+gobbler mcp add --transport stdio tavily npx -y tavily-mcp-server
 ```
 
-Build the capability index by connecting to the server and introspecting its tools:
+Build the capability index by connecting to each server and introspecting its tools:
 
 ```
-gobbler wrap github-mcp
+gobbler wrap github figma tavily
 ```
 
 Install gobbler into your harness:
@@ -69,59 +163,149 @@ gobbler install --harness forge
 gobbler install --harness codex
 ```
 
-The harness now sees only gobbler's 4 tools. All upstream tool calls route through `gobbler serve`, which the harness launches via stdio.
+The harness now sees 4 tools instead of whatever the upstream servers exposed. All tool calls route through `gobbler serve`, which the harness launches automatically via stdio.
 
-Verify everything works:
+## Adding more MCP servers
 
-```
-gobbler doctor
-```
-
-Roll back if needed:
+After the initial setup, adding a new server takes 2 commands:
 
 ```
-gobbler rollback --harness claude
+gobbler mcp add --transport stdio sentry npx -y @sentry/mcp-server
+gobbler wrap sentry
+```
+
+No harness restart required. The new server's capabilities appear in `search_tools` results immediately because the capability index is rebuilt by `gobbler wrap`.
+
+## How it works, end to end
+
+```mermaid
+flowchart TD
+    subgraph Harness ["Claude Code / ForgeCode / Codex"]
+        M[Model]
+    end
+
+    subgraph Gobbler ["gobbler serve (stdio)"]
+        ST[search_tools]
+        EP[execute_plan]
+        CR[call_raw]
+        IT[inspect_tool]
+        CI[Capability Index]
+        EX[Plan Executor]
+        RS[Result Store]
+        SH[Output Shielding]
+    end
+
+    subgraph Upstream ["Upstream MCP Servers"]
+        GH[GitHub MCP]
+        FG[Figma MCP]
+        TV[Tavily MCP]
+    end
+
+    M -->|"search_tools(query)"| ST
+    ST --> CI
+    CI -->|"compressed results"| M
+
+    M -->|"execute_plan({steps:[...]})"| EP
+    EP --> EX
+    EX -->|"step 1"| GH
+    GH -->|"raw response"| RS
+    EX -->|"step 2 (refs step 1)"| FG
+    FG -->|"raw response"| RS
+    RS --> SH
+    SH -->|"shielded final output"| M
+
+    M -->|"call_raw(server, tool, args)"| CR
+    CR --> GH
+    GH -->|"raw"| SH
+
+    M -->|"inspect_tool(server, tool)"| IT
+    IT --> CI
+```
+
+The capability compiler runs at `gobbler wrap` time. It connects to each upstream server via MCP, calls `tools/list`, and builds a `CapabilityIndex`. Each tool becomes a `Capability` struct with a 120-character summary, inferred tags, word-level risk classification (`read`, `write`, or `dangerous`), and a parameter shape string. The index is persisted to `~/.config/gobbler/capabilities/`.
+
+Risk classification uses word-level matching against tool names and descriptions. Words like `delete`, `remove`, `destroy` produce "dangerous". Words like `create`, `update`, `push` produce "write". Everything else defaults to "read". The MCP spec's default annotations (which mark every tool as `DestructiveHint: true` unless overridden) are ignored because they carry no signal.
+
+## Configuration
+
+Gobbler stores its state in `~/.config/gobbler/` on Linux, `~/Library/Application Support/gobbler/` on macOS, and `%APPDATA%/gobbler/` on Windows. Override with `GOBBLER_CONFIG_DIR`.
+
+```
+~/.config/gobbler/
+  servers.json          # server registry
+  capabilities/         # compiled capability indexes (one per server)
+  backups/              # timestamped config backups
+  logs/                 # stderr logs
+```
+
+Output policy defaults:
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `maxOutputBytes` | 65536 (64KB) | Total response size cap |
+| `maxArrayLength` | 50 | Array element limit |
+| `maxStringLength` | 8192 | String value cap |
+| `stepTimeout` | 30s | Per-step execution timeout |
+| `planTimeout` | 120s | Total plan execution timeout |
+| `maxSteps` | 10 | Maximum steps per plan |
+| `allowMutating` | false | Whether write/dangerous tools are permitted |
+
+## Supported harnesses
+
+| Harness | Config location | Detection | Reload |
+|---|---|---|---|
+| ForgeCode | `~/.forge/.mcp.json` or `./.mcp.json` | `forge` binary or `~/.forge/` dir | `forge mcp reload` |
+| Claude Code | `./.mcp.json` | `claude` binary or `~/.claude.json` | Manual restart |
+| Codex | `./.mcp.json` | `codex` binary or `~/.codex/` dir | Manual restart |
+
+## CLI reference
+
+```
+gobbler migrate [--harness <name>] [--dry-run]    # one-shot: pull MCPs from harnesses into gobbler
+gobbler mcp add --transport <type> <name> <cmd..>  # register an upstream MCP server
+gobbler mcp list                                   # list registered servers
+gobbler mcp remove <name>                          # remove a server
+gobbler wrap <server...>                           # build capability index (introspect tools)
+gobbler install --harness <name>                   # inject gobbler into a harness config
+gobbler rollback --harness <name>                  # restore pre-gobbler config from backup
+gobbler doctor                                     # validate installation and connectivity
+gobbler serve                                      # run the MCP wrapper server (stdio)
+gobbler harness detect                             # detect installed harnesses
 ```
 
 ## Project structure
 
-The codebase is 3,751 lines of Go across 27 files. No TypeScript, no containers, no cloud dependencies.
+The codebase is 3,988 lines of Go across 28 files. No TypeScript, no containers, no cloud dependencies. 2 direct dependencies: `mark3labs/mcp-go` for MCP protocol plumbing and `spf13/cobra` for CLI parsing.
 
 ```
 cmd/gobbler/           CLI entrypoint
-internal/cli/          7 command files wired with cobra
+internal/cli/          8 command files wired with cobra
 internal/harness/      Adapter interface + forge/claude/codex implementations
-internal/mcpclient/    MCP client wrapping mark3labs/mcp-go (stdio + HTTP)
-internal/compiler/     Tool schema → capability index compiler
-internal/wrapper/      The MCP wrapper server exposing 4 tools
+internal/mcpclient/    MCP client wrapping mcp-go (stdio + HTTP)
+internal/compiler/     Tool schema -> capability index compiler
+internal/wrapper/      MCP wrapper server exposing 4 tools
 internal/executor/     Multi-step plan executor with step references
 internal/policy/       Output shielding: size limits, field filtering, truncation
 internal/resultstore/  In-memory store for intermediate step results
 internal/backup/       Timestamped config backup and restore
 internal/registry/     Server registry persisted to ~/.config/gobbler/servers.json
-internal/logging/      Stderr-only logger (stdout is reserved for MCP JSON-RPC)
+internal/logging/      Stderr-only logger (stdout reserved for MCP JSON-RPC)
 pkg/config/            Config types and JSON file I/O
 pkg/protocol/          MCP protocol types and tool schema parsing
 ```
 
-## Dependencies
-
-Two direct dependencies. `mark3labs/mcp-go` v0.46.0 handles MCP protocol plumbing: stdio transport, JSON-RPC framing, tool registration, and the server lifecycle. `spf13/cobra` v1.10.2 handles CLI parsing. Everything else is transitive.
-
 ## Tests
 
-16 tests across 4 packages. The compiler tests verify tool compilation, capability search, index merging, tag inference, and risk classification. The policy tests verify output shielding for strings, arrays, JSON field filtering, and tool blocking. The registry tests verify CRUD operations and file persistence. The resultstore tests verify field extraction including array indexing.
+17 tests across 4 packages. Run them with:
 
 ```
 go test ./...
 ```
 
+The compiler tests verify tool compilation, capability search, index merging, tag inference, and risk classification. The policy tests verify output shielding for oversized strings, arrays, JSON field filtering, and tool blocking. The registry tests verify CRUD and file persistence. The resultstore tests verify field extraction including nested paths and array indexing.
+
 ## What this does not do
 
-Gobbler does not run arbitrary model-generated code. The V1 execution model is structured plans: the model submits JSON describing which tools to call with which arguments, and gobbler executes them. There is no eval, no sandbox runtime, no embedded JS engine. That is a deliberate scope decision. Structured execution captures most of the token savings while avoiding the security surface of code execution.
+Gobbler does not run arbitrary model-generated code. The execution model is structured plans: the model submits JSON describing which tools to call with which arguments, and gobbler executes them. There is no eval, no sandbox runtime, no embedded JS engine. Structured execution captures the token savings while avoiding the security surface of code execution.
 
 Gobbler does not replace MCP servers. It proxies them. The upstream servers still run, still handle auth, still do the real work. Gobbler compresses what the harness sees and shields what it receives.
-
-## What comes next
-
-Milestone 2 adds mutating-tool approval gates and richer capability clustering. Milestone 3 adds an optional sandboxed script mode with a child process runtime and parent-process RPC bindings for upstream tool calls. Milestone 4 adds team policies and shared capability manifests.

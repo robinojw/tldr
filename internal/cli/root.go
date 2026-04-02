@@ -41,6 +41,7 @@ ForgeCode, Codex), gobbler sits in between and provides just 4 tools:
 		newWrapCmd(),
 		newInstallCmd(),
 		newRollbackCmd(),
+		newMigrateCmd(),
 		newDoctorCmd(),
 		newServeCmd(),
 	)
