@@ -1,378 +1,400 @@
 # tldr
 
-tldr is a local MCP gateway that sits between your coding harness and your MCP servers. It replaces the full tool surface with 5 wrapper tools. The harness never sees the upstream servers directly.
+`tldr` is a local MCP gateway for coding harnesses.
 
-I built this because MCP tool schemas are expensive. The GitHub MCP server exposes 40+ tools. Each one carries a JSON Schema definition, parameter descriptions, and annotations that get injected into every prompt. The model reads all of it, every time. Cloudflare measured this problem in production and found that collapsing tool surfaces cut their token usage by 81%. tldr applies the same compression locally, in a single Go binary, without requiring Cloudflare Workers or TypeScript runtimes.
+It sits between your harness and your upstream MCP servers, replaces a large tool surface with 5 wrapper tools, keeps large intermediate payloads out of the model context, and lets the model page through stored results only when it actually needs them.
 
-The second problem is response size. A `list_pull_requests` call can return 500KB of JSON. That entire payload gets dumped into the model's context. tldr intercepts it. Arrays get truncated to 50 elements. Strings get capped at 8192 characters. Total output gets clamped to 64KB. But the raw data is not discarded. It stays in tldr's process memory, addressable by a ref handle. The model can page through truncated results using `get_result` with offset and limit parameters.
+In practice, `tldr` is trying to solve two very specific problems:
 
-## How the compression works
+1. **Too many tool schemas in the prompt**
+2. **Too much raw tool output dumped back into the model**
 
-Without tldr, every tool definition from every MCP server is injected into the harness prompt. 3 servers with 40 tools each means 120 tool schemas in the system prompt, consuming thousands of tokens before the model does anything useful.
+This repository is the Go implementation of that wrapper.
 
-With tldr, the harness sees exactly 5 tool definitions. The model discovers capabilities by calling `search_tools`, builds execution plans, and pages through results as needed.
+## What `tldr` actually changes
 
-```mermaid
-graph LR
-    subgraph "Without tldr"
-        H1[Harness] -->|"120 tool schemas<br/>in system prompt"| S1[GitHub MCP]
-        H1 --> S2[Figma MCP]
-        H1 --> S3[Tavily MCP]
-    end
-```
+Without `tldr`, a harness connects directly to every MCP server and usually exposes every upstream tool to the model.
 
-```mermaid
-graph LR
-    subgraph "With tldr"
-        H2[Harness] -->|"5 tool schemas<br/>in system prompt"| G[tldr]
-        G -->|stdio/http| S4[GitHub MCP]
-        G -->|http| S5[Figma MCP]
-        G -->|stdio| S6[Tavily MCP]
-    end
-```
+With `tldr`, the harness points to a single MCP server entry:
 
-The harness prompt shrinks from 120 tool definitions to 5. The model loses nothing because `search_tools` returns exactly the capabilities it needs, on demand, in a compressed format that costs roughly 100 tokens per query.
+- `tldr serve`
 
-## The 5 wrapper tools
+That wrapper only exposes these 5 tools:
 
-`search_tools` takes a query string and searches the compiled capability index. The index contains every upstream tool's name, a 120-character summary, inferred tags, risk classification, and parameter shape. The model uses this to discover what's available without loading full JSON Schemas.
+1. `search_tools`
+2. `execute_plan`
+3. `call_raw`
+4. `inspect_tool`
+5. `get_result`
 
-`execute_plan` takes a JSON plan with ordered steps. Each step names a server, tool, and arguments. tldr executes them sequentially, stores intermediate results in memory, and returns only the final output after applying size limits. Step arguments can reference previous results using `${stepId.field}` syntax.
+Those 5 tools are registered directly by the wrapper server in `internal/wrapper/server.go:100-203`, and the harness integration writes `tldr serve` into the harness config in `internal/harness/harness.go:57-63`.
 
-`call_raw` calls a single upstream tool directly. It is the escape hatch for one-off calls. Output is still subject to response shielding.
+## How this reduces MCP token usage
 
-`inspect_tool` returns the full parameter schema for a specific tool when `search_tools` returned enough to identify the right tool but not enough to build arguments.
+There are two separate token savings mechanisms.
 
-`get_result` pages through a stored result that was truncated. When `execute_plan` or `call_raw` returns a response with `"shielded": true`, the output includes a ref handle and pagination metadata (total count, offset, hasMore). The model calls `get_result` with that ref, an offset, and a limit to retrieve the next page. It also supports field projection: pass `fields: "id,title,state"` to return only those keys from each array element.
+### 1) Tool-surface compression
 
-## Result pagination
+The biggest savings come from **not showing the model every upstream tool schema up front**.
 
-This is the mechanism that makes shielding lossless. Without it, truncation is data loss. With it, truncation is deferred loading.
+When you run `tldr wrap <server...>`, `tldr` connects to each registered upstream server, calls `tools/list`, and compiles every raw MCP tool into a much smaller `Capability` record containing:
 
-Every tool call result -- from `execute_plan` and `call_raw` -- is stored in an in-memory result store keyed by a ref handle. The ref format is `p1:s1` for plan step results or `raw:3` for direct calls. Results persist across plans for 10 minutes (configurable), evicted by TTL or LRU when memory exceeds 128MB.
+- server name
+- tool name
+- short summary
+- inferred tags
+- risk level (`read`, `write`, `dangerous`)
+- compact input shape
+- compact output shape
 
-When the shielding enforcer truncates an array from 200 elements to 50, the response includes structured metadata:
+That compilation happens in `internal/compiler/compiler.go:20-30` and `internal/compiler/compiler.go:51-90`.
 
-```json
-{
-  "output": "[first 50 elements...]",
-  "ref": "p1:s1",
-  "shielded": true,
-  "meta": {
-    "total": 200,
-    "offset": 0,
-    "count": 50,
-    "hasMore": true
-  }
-}
-```
+Instead of injecting all raw upstream schemas into the harness prompt, the harness only sees the 5 wrapper tools from `internal/wrapper/server.go:100-203`.
 
-The model sees 50 elements plus a clear signal that 150 more exist. To get elements 50-99:
+The model then discovers capabilities on demand through `search_tools`, which returns a compact text view of matching capabilities using summary, input shape, and tags from `internal/wrapper/server.go:205-236`.
 
-```json
-{"ref": "p1:s1", "offset": 50, "limit": 50}
-```
+If the model needs more detail for one specific tool, it can call `inspect_tool`, which returns the stored compiled capability entry for that tool in `internal/wrapper/server.go:320-341`.
 
-To get only specific fields from elements 100-149:
+A useful detail here: `tldr` also computes an **approximate token comparison** during wrapping.
 
-```json
-{"ref": "p1:s1", "offset": 100, "limit": 50, "fields": "id,title,state"}
-```
+- raw schema tokens are estimated from the serialized tool schema bytes
+- wrapped tokens are estimated from the serialized compiled capability index
+- the CLI prints the reduction after `tldr wrap`
 
-To navigate into nested objects before slicing:
+That logic lives in `internal/compiler/compiler.go:73-88` and the CLI output is produced in `internal/cli/wrap_cmd.go:71-78`.
 
-```json
-{"ref": "p1:s1", "path": "data.items", "offset": 0, "limit": 25}
-```
+So the token reduction is not just conceptual: the CLI explicitly compares the approximate size of the original tool schemas versus the compressed capability representation.
 
-The store also supports path expressions in `execute_plan` step references. Within a plan, `${s1[50:100]}` slices elements 50-99 from step s1's result and passes them to the next step's arguments. The full path syntax: `ref.field`, `ref[0].field`, `ref[10:20]`, `ref[10:20].field`, `ref[*].field`.
+For a concrete example, I measured the current GitHub MCP server tool list using the same wrap-time accounting path. With 41 upstream tools, the raw tool schemas come out to about **24,473 tokens**, while the compiled capability index is about **3,482 tokens**.
 
 ```mermaid
-sequenceDiagram
-    participant Model
-    participant tldr
-    participant Store
-    participant Upstream
-
-    Model->>tldr: call_raw(github, list_pull_requests, {owner, repo})
-    tldr->>Upstream: list_pull_requests
-    Upstream-->>tldr: 200 PRs (500KB)
-    tldr->>Store: Store full result as raw:1
-    tldr-->>Model: {ref: "raw:1", shielded: true, meta: {total: 200, showing: 50, hasMore: true}}
-    Model->>tldr: get_result(ref: "raw:1", offset: 50, limit: 50, fields: "number,title")
-    tldr->>Store: Slice raw:1[50:100], project [number, title]
-    Store-->>tldr: 50 projected elements
-    tldr-->>Model: {data: [...], meta: {total: 200, offset: 50, count: 50, hasMore: true}}
+---
+config:
+  xyChart:
+    showDataLabel: true
+    showDataLabelOutsideBar: true
+---
+xychart-beta
+    title "Approximate prompt footprint for GitHub MCP"
+    x-axis ["Raw tool schemas", "tldr capability index"]
+    y-axis "Tokens" 0 --> 26000
+    bar [24473, 3482]
 ```
 
-## Response shielding
+That is an **~86% reduction** before you even factor in response shielding. The important point is that this is not a hand-wavy estimate from the README; it is produced by the same schema-versus-capability comparison that `tldr wrap` prints for any wrapped server.
 
-Every response that crosses the boundary from tldr back to the harness passes through the output policy enforcer. The enforcer applies 3 transformations:
+### 2) Response shielding
+
+The second savings mechanism is **keeping large responses out of the model context**.
+
+When `tldr` executes a tool call, it stores the raw result locally and applies output shielding before returning anything to the harness.
+
+The shielding rules come from the default policy config in `pkg/config/config.go:64-89` and the enforcement logic in `internal/policy/policy.go:26-110` and `internal/policy/policy.go:173-212`.
+
+By default, the shielding policy combines a byte budget with structural trimming:
+
+- byte-oriented output is targeted to stay within **64 KB**
+- arrays are capped at **50 elements**
+- strings are capped at **8192 characters**
+
+If a result is too large, `tldr` truncates what the model sees and returns structured metadata showing that more data exists. The raw payload stays in the local result store, which is why truncation is a **defer-load** mechanism rather than blind loss.
+
+For a concrete response-size example, I ran a representative **200-item GitHub-style issues payload** through the same default shielding path. The raw JSON was about **312,877 bytes**, and the shielded result returned to the model was about **85,620 bytes**.
 
 ```mermaid
-flowchart TD
-    A[Upstream MCP Response] --> B{Size > 64KB?}
-    B -->|No| F[Return as-is]
-    B -->|Yes| C[Parse as JSON]
-    C --> D[Truncate arrays to 50 elements]
-    D --> E[Cap strings at 8192 chars]
-    E --> G[Clamp total to 64KB]
-    G --> H[Return shielded result]
-    C -->|Parse fails| I[Truncate raw text at 64KB]
+---
+config:
+  xyChart:
+    showDataLabel: true
+    showDataLabelOutsideBar: true
+---
+xychart-beta
+    title "Approximate response footprint after shielding"
+    x-axis ["Raw JSON response", "Shielded model-visible response"]
+    y-axis "Bytes" 0 --> 330000
+    bar [312877, 85620]
 ```
 
-For `execute_plan`, intermediate step results never leave tldr. They are stored in an in-memory `resultstore.Store` keyed by plan-scoped ref handles (`p1:s1`, `p2:s1`). The model can reference them in subsequent steps via `${s1.field}` syntax, and the raw payloads persist across plans for 10 minutes. Only the final step's shielded output is returned to the harness. If the model needs data that was truncated, it calls `get_result` with the ref handle.
+That is an **~73% reduction** before the model does any follow-up paging with `get_result`. In this kind of large array response, the biggest savings come from the default policy trimming the top-level payload down to 50 summarized items while keeping the full raw result available locally.
 
-## The migration flow
+## How intermediate data stays out of the prompt
 
-```mermaid
-sequenceDiagram
-    participant User
-    participant tldr
-    participant Harness Config
-    participant Backup
+`execute_plan` is the main mechanism for multi-step work.
 
-    User->>tldr: tldr migrate
-    tldr->>Harness Config: Read .mcp.json
-    Harness Config-->>tldr: {github: {...}, figma: {...}, tavily: {...}}
-    tldr->>Backup: Backup original config
-    tldr->>tldr: Import servers into registry
-    tldr->>Harness Config: Rewrite with {tldr: {command: "tldr", args: ["serve"]}}
-    tldr-->>User: Migrated 3 servers. Config backed up.
-```
+A plan is a list of structured steps, where each step specifies:
 
-`tldr migrate` reads the existing `.mcp.json` from each detected harness, imports every MCP server entry into tldr's registry, backs up the original config, and rewrites it with a single `tldr` entry. One command replaces the entire MCP setup.
+- `id`
+- `server`
+- `tool`
+- `arguments`
+- optional `dependsOn`
 
-## Install
+Those types are defined in `internal/executor/executor.go:36-56`.
 
-The install script detects your OS and architecture, downloads the latest release binary, and places it in `/usr/local/bin`. If no release exists yet, it falls back to building from source (requires Go 1.22+).
+When a plan runs:
 
-```
-curl -sSfL https://raw.githubusercontent.com/robinojw/tldr/main/install.sh | sh
-```
+- steps execute with dependency awareness
+- steps with no unmet dependencies can run concurrently
+- each raw step result is stored locally with a ref like `p1:s1`
+- only the final selected output is returned to the model
 
-Or install directly with Go:
+That behavior is implemented in `internal/executor/executor.go:115-349`.
 
-```
-go install github.com/robinojw/tldr/cmd/tldr@latest
-```
+The important token-saving detail is that **intermediate step outputs do not get streamed back into the harness context**. They stay in the result store and can be referenced by later steps using `${stepId.field}` syntax from `internal/executor/executor.go:394-415`.
 
-Or clone and build:
+For one-off calls, `call_raw` follows the same pattern:
 
-```
-git clone https://github.com/robinojw/tldr.git
-cd tldr
-go build -o tldr ./cmd/tldr
-sudo mv tldr /usr/local/bin/
-```
+- call the upstream tool
+- store the raw result
+- return only the shielded version plus a `ref`
 
-## Quick start: one-command migration
+See `internal/executor/executor.go:352-392`.
 
-If you already have MCP servers configured in Claude Code, ForgeCode, or Codex, this is the fastest path.
+## How pagination works
 
-```
+The result store is what makes shielding usable.
+
+Stored results are keyed by refs such as:
+
+- `p1:s1` for plan step results
+- `raw:3` for direct calls
+
+The store implementation is in `internal/resultstore/store.go:32-149`.
+
+The defaults are:
+
+- **10 minute TTL**: `internal/resultstore/store.go:26-30`
+- **128 MB max in-memory storage**: `internal/resultstore/store.go:29-30`
+
+Expired entries are cleaned out of both memory and the disk-backed result directory during normal access, so stored response files do not accumulate indefinitely. That cleanup path lives in `internal/resultstore/store.go:157-176`, `internal/resultstore/store.go:563-689`, and `internal/resultstore/store.go:691-746`.
+
+When `tldr serve` is started through the CLI, it uses a disk-backed results directory under the config directory, so stored results can survive process restarts for non-expired entries. That wiring is in `internal/cli/serve_cmd.go:93-97`, and disk-backed loading/writing is in `internal/resultstore/store.go:96-109` and `internal/resultstore/store.go:661-746`.
+
+The wrapper exposes `get_result` so the model can page through a stored result by ref. `get_result` supports:
+
+- `offset` / `limit` pagination
+- field projection with `fields`
+- nested navigation with `path`
+- ripgrep-backed search with `pattern`, `before`, `after`, and `max_matches`
+
+That interface is defined in `internal/wrapper/server.go:174-212` and handled in `internal/wrapper/server.go:355-392`.
+
+The slicing and projection logic lives in `internal/resultstore/store.go:214-302`. Stored-result search now uses the real `rg` binary and caches rendered searchable text for repeated lookups on the same result/path, which is implemented in `internal/resultstore/store.go:323-499`.
+
+So the model does **not** need the full 500 KB response in its prompt. It gets a smaller first view, then requests only the next page, the specific fields it needs, or a ripgrep-matched snippet from the stored payload.
+
+## How the “sandboxing” works
+
+If you describe `tldr` as “sandboxing,” the important thing to understand is that this is **not** an operating-system sandbox and **not** arbitrary code execution.
+
+`tldr` does not run model-generated code. It accepts structured plans and forwards calls only to registered MCP tools. The core safety model is:
+
+### 1) Structured execution only
+
+The model cannot send arbitrary programs to run inside `tldr`.
+
+It can only:
+
+- search capabilities
+- inspect a stored capability
+- submit a JSON plan
+- make a direct raw tool call
+- fetch paginated stored results
+
+The wrapper instructions themselves describe that workflow in `internal/wrapper/server.go:501-519`.
+
+### 2) The model is limited to registered MCP servers
+
+`tldr serve` opens the local registry, connects only to wrapped servers, merges their capability indexes, and then serves the 5-tool wrapper on stdio. That startup path is in `internal/cli/serve_cmd.go:34-105` and the registry behavior is in `internal/registry/registry.go:24-118`.
+
+So the model is constrained to the upstream servers you registered with `tldr mcp add` and marked for wrapping with `tldr wrap`.
+
+### 3) Mutating tools are blocked by default
+
+The default policy sets `AllowMutating` to `false` in `pkg/config/config.go:77-89`.
+
+Before `execute_plan` runs any step, and before `call_raw` executes any tool, `tldr` checks whether the tool is:
+
+- explicitly blocked
+- classified as `write`
+- classified as `dangerous`
+
+Those checks happen in `internal/executor/executor.go:144-167` for plans and `internal/executor/executor.go:355-367` for raw calls.
+
+Risk classification comes from the compiled capability index in `internal/compiler/compiler.go:20-30`, or from a name-based fallback heuristic in `internal/executor/executor.go:474-499`.
+
+In other words: by default, the model is effectively in a **read-mostly execution sandbox** unless you explicitly permit mutating tools.
+
+### 4) Additional policy controls exist
+
+The policy layer also supports:
+
+- blocked tool names
+- per-step timeout
+- plan timeout
+- maximum step count
+
+Those policy fields are defined in `pkg/config/config.go:64-75`, and the executor enforces the plan and step limits in `internal/executor/executor.go:121-132` and `internal/executor/executor.go:265-268`.
+
+So the sandboxing model is really a combination of:
+
+- a tiny wrapper tool surface
+- no arbitrary code execution
+- only registered upstream servers
+- read-only by default
+- explicit blocklists
+- time and size limits
+- local result containment
+
+### 5) Data containment is local to `tldr`
+
+Raw upstream responses are intentionally kept inside the local result store instead of being forwarded to the model. That design is described in `internal/resultstore/store.go:1-12` and enforced during execution in `internal/executor/executor.go:287-310` and `internal/executor/executor.go:379-390`.
+
+So “sandboxing” here also means **the model gets a filtered view of tool output, not the whole raw payload by default**.
+
+## What `inspect_tool` does and does not do
+
+One subtle but important detail: `inspect_tool` does **not** fetch and return the full original upstream JSON Schema.
+
+It returns the compiled `Capability` entry from the local index in `internal/wrapper/server.go:331-337`, which means it is still a compressed representation.
+
+That is consistent with `tldr`'s design goal: keep discovery cheap, and only expose exactly as much structure as the model needs.
+
+## End-to-end model workflow
+
+A typical interaction looks like this:
+
+1. The model calls `search_tools` to discover relevant capabilities.
+2. If needed, it calls `inspect_tool` for a specific capability record.
+3. It builds an `execute_plan` request for multi-step work, or uses `call_raw` for a one-off call.
+4. `tldr` stores raw results locally.
+5. `tldr` returns only a shielded final output.
+6. If the result was truncated, the model calls `get_result` with the returned ref.
+
+That wrapper pattern is encoded directly in `internal/wrapper/server.go:100-203`, `internal/wrapper/server.go:238-395`, and `internal/wrapper/server.go:501-519`.
+
+## CLI workflow
+
+### Fastest path: migrate an existing harness
+
+If you already have MCP servers configured in a supported harness, the intended entrypoint is:
+
+```bash
 tldr migrate
 ```
 
-That command detects every installed harness, reads its `.mcp.json`, imports all servers into tldr's registry, backs up the original config, and rewrites each harness to point only at tldr. The `--dry-run` flag shows what would happen without making changes:
+`migrate` will:
 
-```
+- detect supported harnesses
+- read their existing MCP config
+- import each server into `tldr`
+- back up the original config
+- rewrite the harness config to point only at `tldr`
+
+That behavior is implemented in `internal/cli/migrate_cmd.go:24-177`, with backup handling in `internal/backup/backup.go:16-39`.
+
+Preview the changes first:
+
+```bash
 tldr migrate --dry-run
 ```
 
-To migrate a single harness:
+Then verify the installation:
 
-```
-tldr migrate --harness claude
-```
-
-Verify the migration:
-
-```
+```bash
 tldr mcp list
 tldr doctor
 ```
 
-Roll back any harness to its pre-tldr config:
+### Manual setup
 
-```
-tldr rollback --harness claude
-```
+If you want to register servers yourself:
 
-## Manual setup
-
-If you prefer to set things up piece by piece.
-
-Register upstream MCP servers:
-
-```
+```bash
 tldr mcp add --transport stdio github npx -y @modelcontextprotocol/server-github
-tldr mcp add --transport http figma https://mcp.figma.com/mcp
-tldr mcp add --transport stdio tavily npx -y tavily-mcp-server
-```
-
-Build the capability index by connecting to each server and introspecting its tools:
-
-```
-tldr wrap github figma tavily
-```
-
-Install tldr into your harness:
-
-```
-tldr install --harness claude
+tldr wrap github
 tldr install --harness forge
-tldr install --harness codex
 ```
 
-The harness now sees 5 tools instead of whatever the upstream servers exposed. All tool calls route through `tldr serve`, which the harness launches automatically via stdio.
+The registry command flow lives in `internal/cli/mcp_cmd.go:29-99`, capability compilation in `internal/cli/wrap_cmd.go:13-84`, and harness installation in `internal/cli/install_cmd.go:13-70`.
 
-## Adding more MCP servers
+### Detect harnesses
 
-After the initial setup, adding a new server takes 2 commands:
-
-```
-tldr mcp add --transport stdio sentry npx -y @sentry/mcp-server
-tldr wrap sentry
+```bash
+tldr harness detect
 ```
 
-No harness restart required. The new server's capabilities appear in `search_tools` results immediately because the capability index is rebuilt by `tldr wrap`.
-
-## How it works, end to end
-
-```mermaid
-flowchart TD
-    subgraph Harness ["Claude Code / ForgeCode / Codex"]
-        M[Model]
-    end
-
-    subgraph tldr ["tldr serve (stdio)"]
-        ST[search_tools]
-        EP[execute_plan]
-        CR[call_raw]
-        IT[inspect_tool]
-        GR[get_result]
-        CI[Capability Index]
-        EX[Plan Executor]
-        RS[Result Store]
-        SH[Output Shielding]
-    end
-
-    subgraph Upstream ["Upstream MCP Servers"]
-        GH[GitHub MCP]
-        FG[Figma MCP]
-        TV[Tavily MCP]
-    end
-
-    M -->|"search_tools(query)"| ST
-    ST --> CI
-    CI -->|"compressed results"| M
-
-    M -->|"execute_plan({steps:[...]})"| EP
-    EP --> EX
-    EX -->|"step 1"| GH
-    GH -->|"raw response"| RS
-    EX -->|"step 2 (refs step 1)"| FG
-    FG -->|"raw response"| RS
-    RS --> SH
-    SH -->|"shielded final output"| M
-
-    M -->|"call_raw(server, tool, args)"| CR
-    CR --> GH
-    GH -->|"raw"| SH
-
-    M -->|"inspect_tool(server, tool)"| IT
-    IT --> CI
-
-    M -->|"get_result(ref, offset, limit)"| GR
-    GR --> RS
-    RS -->|"paginated slice"| M
-```
-
-The capability compiler runs at `tldr wrap` time. It connects to each upstream server via MCP, calls `tools/list`, and builds a `CapabilityIndex`. Each tool becomes a `Capability` struct with a 120-character summary, inferred tags, word-level risk classification (`read`, `write`, or `dangerous`), and a parameter shape string. The index is persisted to `~/.config/tldr/capabilities/`.
-
-Risk classification uses word-level matching against tool names and descriptions. Words like `delete`, `remove`, `destroy` produce "dangerous". Words like `create`, `update`, `push` produce "write". Everything else defaults to "read". The MCP spec's default annotations (which mark every tool as `DestructiveHint: true` unless overridden) are ignored because they carry no signal.
-
-## Configuration
-
-tldr stores its state in `~/.config/tldr/` on Linux, `~/Library/Application Support/tldr/` on macOS, and `%APPDATA%/tldr/` on Windows. Override with `TLDR_CONFIG_DIR`.
-
-```
-~/.config/tldr/
-  servers.json          # server registry
-  capabilities/         # compiled capability indexes (one per server)
-  backups/              # timestamped config backups
-  logs/                 # stderr logs
-```
-
-Output policy defaults:
-
-| Setting | Default | Purpose |
-|---|---|---|
-| `maxOutputBytes` | 65536 (64KB) | Total response size cap |
-| `maxArrayLength` | 50 | Array element limit |
-| `maxStringLength` | 8192 | String value cap |
-| `stepTimeout` | 30s | Per-step execution timeout |
-| `planTimeout` | 120s | Total plan execution timeout |
-| `maxSteps` | 10 | Maximum steps per plan |
-| `allowMutating` | false | Whether write/dangerous tools are permitted |
+Harness detection is implemented in `internal/cli/harness_cmd.go:21-44`.
 
 ## Supported harnesses
 
-| Harness | Config location | Detection | Reload |
-|---|---|---|---|
-| ForgeCode | `~/.forge/.mcp.json` or `./.mcp.json` | `forge` binary or `~/.forge/` dir | `forge mcp reload` |
-| Claude Code | `./.mcp.json` | `claude` binary or `~/.claude.json` | Manual restart |
-| Codex | `./.mcp.json` | `codex` binary or `~/.codex/` dir | Manual restart |
+The current adapters are:
 
-## CLI reference
+- Forge
+- Claude Code
+- Codex
 
-```
-tldr migrate [--harness <name>] [--dry-run]    # one-shot: pull MCPs from harnesses into tldr
-tldr mcp add --transport <type> <name> <cmd..>  # register an upstream MCP server
-tldr mcp list                                   # list registered servers
-tldr mcp remove <name>                          # remove a server
-tldr wrap <server...>                           # build capability index (introspect tools)
-tldr install --harness <name>                   # inject tldr into a harness config
-tldr rollback --harness <name>                  # restore pre-tldr config from backup
-tldr doctor                                     # validate installation and connectivity
-tldr serve                                      # run the MCP wrapper server (stdio)
-tldr harness detect                             # detect installed harnesses
-```
+They are registered in `internal/cli/root.go:12-18`.
 
-## Project structure
+## Configuration and storage
 
-The codebase is 5,008 lines of Go across 28 files. No TypeScript, no containers, no cloud dependencies. 2 direct dependencies: `mark3labs/mcp-go` for MCP protocol plumbing and `spf13/cobra` for CLI parsing.
+`tldr` stores its state in platform-specific config directories returned by `pkg/config/config.go:111-131`.
 
-```
-cmd/tldr/           CLI entrypoint
-internal/cli/          8 command files wired with cobra
-internal/harness/      Adapter interface + forge/claude/codex implementations
-internal/mcpclient/    MCP client wrapping mcp-go (stdio + HTTP)
-internal/compiler/     Tool schema -> capability index compiler
-internal/wrapper/      MCP wrapper server exposing 5 tools
-internal/executor/     Multi-step plan executor with step references
-internal/policy/       Output shielding: size limits, field filtering, truncation
-internal/resultstore/  In-memory store for intermediate step results
-internal/backup/       Timestamped config backup and restore
-internal/registry/     Server registry persisted to ~/.config/tldr/servers.json
-internal/logging/      Stderr-only logger (stdout reserved for MCP JSON-RPC)
-pkg/config/            Config types and JSON file I/O
-pkg/protocol/          MCP protocol types and tool schema parsing
-```
+Key paths include:
+
+- server registry: `pkg/config/config.go:133-136`
+- capability indexes: `pkg/config/config.go:138-141`
+- backups: `pkg/config/config.go:143-146`
+- logs: `pkg/config/config.go:148-151`
+
+Default policy values are defined in `pkg/config/config.go:77-89`:
+
+| Setting | Default |
+| --- | --- |
+| `maxOutputBytes` | `65536` |
+| `maxArrayLength` | `50` |
+| `maxStringLength` | `8192` |
+| `stepTimeout` | `30s` |
+| `planTimeout` | `120s` |
+| `maxSteps` | `10` |
+| `allowMutating` | `false` |
+
+## Project layout
+
+Core packages:
+
+- `internal/wrapper/` — the 5-tool MCP wrapper server
+- `internal/compiler/` — raw tool schema -> compressed capability index
+- `internal/executor/` — structured multi-step execution and ref handling
+- `internal/policy/` — output shielding and safety controls
+- `internal/resultstore/` — local result persistence, pagination, projection
+- `internal/registry/` — upstream server registry and policy config
+- `internal/harness/` — harness adapters for install/migrate/rollback
+- `pkg/config/` — shared config types and filesystem locations
 
 ## Tests
 
-26 tests across 4 packages. Run them with:
+Run the test suite with:
 
-```
+```bash
 go test ./...
 ```
 
-The compiler tests verify tool compilation, capability search, index merging, tag inference, and risk classification. The policy tests verify output shielding for oversized strings, arrays, JSON field filtering, and tool blocking. The registry tests verify CRUD and file persistence. The resultstore tests verify pagination with offset/limit, field projection, array slicing, string slicing, plan-scoped refs, TTL eviction, shape analysis, and cross-plan persistence.
+There are focused tests for the compiler, executor, policy layer, registry, and result store under:
 
-## What this does not do
+- `internal/compiler/compiler_test.go`
+- `internal/executor/executor_test.go`
+- `internal/policy/policy_test.go`
+- `internal/registry/registry_test.go`
+- `internal/resultstore/store_test.go`
 
-tldr does not run arbitrary model-generated code. The execution model is structured plans: the model submits JSON describing which tools to call with which arguments, and tldr executes them. There is no eval, no sandbox runtime, no embedded JS engine. Structured execution captures the token savings while avoiding the security surface of code execution.
+## What `tldr` is not
 
-tldr does not replace MCP servers. It proxies them. The upstream servers still run, still handle auth, still do the real work. tldr compresses what the harness sees and shields what it receives.
+`tldr` is not:
+
+- a replacement for MCP servers
+- a cloud service
+- an arbitrary code runner
+- an OS-level sandbox
+
+It is a **local MCP gateway** that makes MCP usage cheaper for models by compressing tool discovery and containing large tool outputs.

@@ -1,8 +1,11 @@
 package resultstore
 
 import (
+	"context"
 	"encoding/json"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -223,6 +226,110 @@ func TestSlice_StringPagination(t *testing.T) {
 	}
 }
 
+func TestGrep_StringWithContext(t *testing.T) {
+	s := New()
+
+	payload := "alpha\nbeta match\ngamma\ndelta match\nepsilon"
+	raw, _ := json.Marshal(payload)
+	s.Put("s1", &StepResult{StepID: "s1", Raw: raw})
+
+	data, meta, err := s.Grep(context.Background(), "s1", "", "match", 1, 1, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.TotalMatches != 2 {
+		t.Fatalf("expected 2 matches, got %d", meta.TotalMatches)
+	}
+	if !strings.Contains(data, "2:beta match") {
+		t.Fatalf("expected ripgrep-style match output, got %q", data)
+	}
+	if !strings.Contains(data, "1-alpha") || !strings.Contains(data, "3-gamma") {
+		t.Fatalf("expected context lines around first match, got %q", data)
+	}
+}
+
+func TestGrep_Path(t *testing.T) {
+	s := New()
+
+	raw, _ := json.Marshal(map[string]interface{}{
+		"data": map[string]interface{}{
+			"items": []map[string]interface{}{
+				{"title": "first"},
+				{"title": "needle title"},
+			},
+		},
+	})
+	s.Put("s1", &StepResult{StepID: "s1", Raw: raw})
+
+	data, meta, err := s.Grep(context.Background(), "s1", "data.items", "needle", 0, 0, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.TotalMatches != 1 {
+		t.Fatalf("expected 1 match, got %d", meta.TotalMatches)
+	}
+	if !strings.Contains(data, "needle title") {
+		t.Fatalf("expected nested path search result, got %q", data)
+	}
+}
+
+func TestGrep_TruncatesMatches(t *testing.T) {
+	s := New()
+
+	payload := "match 1\nmatch 2\nmatch 3"
+	raw, _ := json.Marshal(payload)
+	s.Put("s1", &StepResult{StepID: "s1", Raw: raw})
+
+	_, meta, err := s.Grep(context.Background(), "s1", "", "match", 0, 0, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.TotalMatches != 3 {
+		t.Fatalf("expected totalMatches=3, got %d", meta.TotalMatches)
+	}
+	if meta.ReturnedMatches != 2 {
+		t.Fatalf("expected returnedMatches=2, got %d", meta.ReturnedMatches)
+	}
+	if !meta.Truncated {
+		t.Fatal("expected truncated=true")
+	}
+}
+
+func TestGrep_CachesSearchableTextFiles(t *testing.T) {
+	dir := t.TempDir()
+	s := NewDiskBacked(dir)
+
+	payload := map[string]interface{}{
+		"items": []map[string]interface{}{
+			{"title": "first"},
+			{"title": "second needle"},
+		},
+	}
+	raw, _ := json.Marshal(payload)
+	s.Put("s1", &StepResult{StepID: "s1", Raw: raw})
+
+	for i := 0; i < 2; i++ {
+		data, meta, err := s.Grep(context.Background(), "s1", "items", "needle", 0, 0, 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if meta.TotalMatches != 1 {
+			t.Fatalf("expected 1 match, got %d", meta.TotalMatches)
+		}
+		if !strings.Contains(data, "needle") {
+			t.Fatalf("expected rg output to include match, got %q", data)
+		}
+	}
+
+	entries, err := os.ReadDir(filepath.Join(dir, ".search"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("expected one cached ripgrep search file, found %d", len(entries))
+	}
+}
+
 func TestPutRaw(t *testing.T) {
 	s := New()
 
@@ -287,6 +394,29 @@ func TestTTLEviction(t *testing.T) {
 	_, ok = s.Get("s1")
 	if ok {
 		t.Error("expected s1 to be expired")
+	}
+}
+
+func TestTTLEvictionDeletesDiskFileOnAccess(t *testing.T) {
+	dir := t.TempDir()
+	s := NewDiskBacked(dir)
+	s.ttl = 1 * time.Millisecond
+
+	raw, _ := json.Marshal("test")
+	s.Put("s1", &StepResult{StepID: "s1", Raw: raw})
+
+	time.Sleep(5 * time.Millisecond)
+
+	if _, ok := s.Get("s1"); ok {
+		t.Fatal("expected expired result to be evicted on access")
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected expired disk-backed result to be deleted, found %d files", len(entries))
 	}
 }
 

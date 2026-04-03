@@ -171,15 +171,15 @@ func (s *Server) registerTools() {
 	)
 	s.mcpServer.AddTool(inspectTool, s.handleInspectTool)
 
-	// Tool 5: get_result (pagination for stored results)
+	// Tool 5: get_result (pagination and ripgrep search for stored results)
 	getResultTool := mcp.NewTool("get_result",
 		mcp.WithDescription(
-			"Page through a stored result that was truncated. "+
+			"Retrieve specific parts of a stored result. "+
 				"When execute_plan or call_raw returns a truncated response, the output includes "+
 				"a 'ref' handle and metadata (total items, showing count, hasMore). "+
 				"Use this tool with that ref to retrieve the next page, specific array slices, "+
-				"or project specific fields from array elements. "+
-				"Results are held in memory for 10 minutes after creation."),
+				"project specific fields from array elements, or run ripgrep against the stored payload. "+
+				"Results are retained for a limited time and expired entries are cleaned up automatically."),
 		mcp.WithString("ref",
 			mcp.Required(),
 			mcp.Description("Result ref handle from a previous execute_plan or call_raw response (e.g. 'p1:s1', 'raw:3')"),
@@ -194,7 +194,19 @@ func (s *Server) registerTools() {
 			mcp.Description("Comma-separated list of fields to project from each array element (e.g. 'id,title,state'). Omit to return full elements."),
 		),
 		mcp.WithString("path",
-			mcp.Description("Optional path expression to navigate into the result before slicing (e.g. 'items', 'data.results'). Supports dot notation."),
+			mcp.Description("Optional path expression to navigate into the result before slicing or searching (e.g. 'items', 'data.results'). Supports dot notation."),
+		),
+		mcp.WithString("pattern",
+			mcp.Description("Optional ripgrep pattern to search against the stored result or selected path."),
+		),
+		mcp.WithNumber("before",
+			mcp.Description("When pattern is set, include this many context lines before each match (default: 0)."),
+		),
+		mcp.WithNumber("after",
+			mcp.Description("When pattern is set, include this many context lines after each match (default: 0)."),
+		),
+		mcp.WithNumber("max_matches",
+			mcp.Description("When pattern is set, return at most this many matches (default: 20)."),
 		),
 	)
 	s.mcpServer.AddTool(getResultTool, s.handleGetResult)
@@ -350,6 +362,10 @@ func (s *Server) handleGetResult(ctx context.Context, req mcp.CallToolRequest) (
 	limit := req.GetInt("limit", 50)
 	fieldsStr := req.GetString("fields", "")
 	pathExpr := req.GetString("path", "")
+	pattern := req.GetString("pattern", "")
+	before := req.GetInt("before", 0)
+	after := req.GetInt("after", 0)
+	maxMatches := req.GetInt("max_matches", 20)
 
 	// Parse fields
 	var fields []string
@@ -359,6 +375,20 @@ func (s *Server) handleGetResult(ctx context.Context, req mcp.CallToolRequest) (
 				fields = append(fields, f)
 			}
 		}
+	}
+
+	// Regex-style search over the stored result or a nested path.
+	if pattern != "" {
+		data, meta, err := s.store.Grep(ctx, ref, pathExpr, pattern, before, after, maxMatches)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("get_result search failed: %v", err)), nil
+		}
+		response := map[string]interface{}{
+			"data": data,
+			"meta": meta,
+		}
+		out, _ := json.MarshalIndent(response, "", "  ")
+		return mcp.NewToolResultText(string(out)), nil
 	}
 
 	// If a path is specified, extract that sub-value first, then slice
@@ -506,7 +536,7 @@ Instead of calling many individual MCP tools directly, use tldr's small surface:
 2. execute_plan: Run multi-step plans against upstream tools. Intermediate results stay inside tldr -- you only see the final output.
 3. call_raw: Call a single tool directly (escape hatch, still shielded).
 4. inspect_tool: Get detailed parameter info for a specific tool.
-5. get_result: Page through stored results when responses are truncated.
+5. get_result: Page through stored results, or run ripgrep against them when you need a specific fragment.
 
 Workflow:
 1. Use search_tools to find relevant capabilities.
@@ -514,6 +544,8 @@ Workflow:
 3. Build a plan with execute_plan for multi-step operations.
 4. Use call_raw for simple one-off calls.
 5. If any response shows "shielded: true" or "hasMore: true", use get_result with the "ref" handle to get the next page.
+6. If you need a specific snippet from a large stored payload, call get_result with "pattern" and optional "before"/"after" context to run ripgrep.
 
 Plans use step references: arguments can reference previous step results with ${stepId.field} syntax.
-Pagination: get_result supports offset/limit for arrays, field projection via comma-separated fields, and path expressions to navigate into nested objects.`
+Stored results expire automatically after a short TTL.
+get_result supports offset/limit for arrays, field projection via comma-separated fields, path expressions to navigate into nested objects, and ripgrep search over the stored payload.`

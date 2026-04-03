@@ -12,9 +12,13 @@
 package resultstore
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -39,11 +43,12 @@ type Store struct {
 	totalBytes int
 	rawCounter atomic.Int64
 	diskPath   string // if set, results are persisted to/loaded from this directory
+	searchDir  string // cached searchable text files used by ripgrep-backed result search
 }
 
 // StepResult is the stored result of a single execution step.
 type StepResult struct {
-	Ref       string          `json:"ref"`       // addressable handle: "p1:s1" or "raw:3"
+	Ref       string          `json:"ref"` // addressable handle: "p1:s1" or "raw:3"
 	PlanID    string          `json:"planId"`
 	StepID    string          `json:"stepId"`
 	Server    string          `json:"server"`
@@ -56,7 +61,7 @@ type StepResult struct {
 	ExpiresAt time.Time       `json:"expiresAt"`
 
 	// Precomputed metadata about the raw result
-	ArrayLen  int  `json:"arrayLen,omitempty"`  // -1 if not an array
+	ArrayLen  int  `json:"arrayLen,omitempty"` // -1 if not an array
 	IsArray   bool `json:"isArray,omitempty"`
 	StringLen int  `json:"stringLen,omitempty"` // -1 if not a string
 	IsString  bool `json:"isString,omitempty"`
@@ -121,6 +126,7 @@ func (s *Store) Put(stepID string, result *StepResult) {
 
 	s.evictExpired()
 	s.evictIfNeeded(result.ByteSize)
+	s.deleteSearchCache(result.Ref)
 
 	s.results[result.Ref] = result
 	s.order = append(s.order, result.Ref)
@@ -150,19 +156,19 @@ func (s *Store) PutRaw(server, tool string, raw json.RawMessage) string {
 
 // Get retrieves a step result by ref handle.
 func (s *Store) Get(ref string) (*StepResult, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.evictExpired()
 
 	// Try exact match first
 	if r, ok := s.results[ref]; ok {
-		if time.Now().Before(r.ExpiresAt) {
-			return r, true
-		}
+		return r, true
 	}
 
 	// Try legacy stepID-only lookup (backward compat within a plan)
 	for _, r := range s.results {
-		if r.StepID == ref && time.Now().Before(r.ExpiresAt) {
+		if r.StepID == ref {
 			return r, true
 		}
 	}
@@ -181,8 +187,10 @@ func (s *Store) Get(ref string) (*StepResult, bool) {
 //	"ref[*].field"        - project a field from every array element
 //	"ref"                 - return the whole parsed result
 func (s *Store) ExtractField(expr string) (interface{}, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.evictExpired()
 
 	ref, path, err := parseRef(expr)
 	if err != nil {
@@ -207,8 +215,10 @@ func (s *Store) ExtractField(expr string) (interface{}, error) {
 // offset and limit operate on the top-level array. If fields is non-empty,
 // only those fields are projected from each element.
 func (s *Store) Slice(ref string, offset, limit int, fields []string) (interface{}, *SliceMeta, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.evictExpired()
 
 	result, ok := s.findResult(ref)
 	if !ok {
@@ -301,44 +311,249 @@ type SliceMeta struct {
 	HasMore bool   `json:"hasMore"`
 }
 
+// GrepMeta contains metadata about line-oriented regex searches over stored results.
+type GrepMeta struct {
+	Ref             string `json:"ref"`
+	Pattern         string `json:"pattern"`
+	TotalMatches    int    `json:"totalMatches"`
+	ReturnedMatches int    `json:"returnedMatches"`
+	Truncated       bool   `json:"truncated"`
+}
+
+// Grep searches a stored result with the real ripgrep binary.
+// If path is set, the search runs against that nested sub-value instead of the full result.
+func (s *Store) Grep(ctx context.Context, ref, path, pattern string, before, after, maxMatches int) (string, *GrepMeta, error) {
+	s.mu.Lock()
+	s.evictExpired()
+
+	result, ok := s.findResult(ref)
+	if !ok {
+		s.mu.Unlock()
+		return "", nil, fmt.Errorf("result %q not found or expired", ref)
+	}
+
+	if maxMatches <= 0 {
+		maxMatches = 20
+	}
+	if before < 0 {
+		before = 0
+	}
+	if after < 0 {
+		after = 0
+	}
+
+	searchPath, err := s.ensureSearchFileLocked(ref, path, result.Raw)
+	s.mu.Unlock()
+	if err != nil {
+		return "", nil, err
+	}
+
+	rgPath, err := exec.LookPath("rg")
+	if err != nil {
+		return "", nil, fmt.Errorf("ripgrep binary not available: %w", err)
+	}
+
+	totalMatches, err := runRipgrepCount(ctx, rgPath, pattern, searchPath)
+	if err != nil {
+		return "", nil, err
+	}
+	if totalMatches == 0 {
+		meta := &GrepMeta{Ref: ref, Pattern: pattern, TotalMatches: 0, ReturnedMatches: 0, Truncated: false}
+		return "", meta, nil
+	}
+
+	returnedMatches := totalMatches
+	truncated := false
+	if returnedMatches > maxMatches {
+		returnedMatches = maxMatches
+		truncated = true
+	}
+
+	data, err := runRipgrepSearch(ctx, rgPath, pattern, searchPath, before, after, maxMatches)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return data, &GrepMeta{
+		Ref:             ref,
+		Pattern:         pattern,
+		TotalMatches:    totalMatches,
+		ReturnedMatches: returnedMatches,
+		Truncated:       truncated,
+	}, nil
+}
+
+func runRipgrepCount(ctx context.Context, rgPath, pattern, searchPath string) (int, error) {
+	args := []string{"--count", "--color", "never", "--no-heading", "--no-filename", "--", pattern, searchPath}
+	out, err := exec.CommandContext(ctx, rgPath, args...).CombinedOutput()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("ripgrep count failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+
+	countStr := strings.TrimSpace(string(out))
+	if countStr == "" {
+		return 0, nil
+	}
+	count, err := strconv.Atoi(countStr)
+	if err != nil {
+		return 0, fmt.Errorf("unexpected ripgrep count output %q: %w", countStr, err)
+	}
+	return count, nil
+}
+
+func runRipgrepSearch(ctx context.Context, rgPath, pattern, searchPath string, before, after, maxMatches int) (string, error) {
+	args := []string{"--color", "never", "--line-number", "--no-heading", "--no-filename", "--context-separator", "--"}
+	if before > 0 {
+		args = append(args, "-B", strconv.Itoa(before))
+	}
+	if after > 0 {
+		args = append(args, "-A", strconv.Itoa(after))
+	}
+	args = append(args, "-m", strconv.Itoa(maxMatches), "--", pattern, searchPath)
+
+	out, err := exec.CommandContext(ctx, rgPath, args...).CombinedOutput()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
+			return "", nil
+		}
+		return "", fmt.Errorf("ripgrep search failed: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return strings.TrimRight(string(out), "\n"), nil
+}
+
+func (s *Store) ensureSearchFileLocked(ref, path string, raw json.RawMessage) (string, error) {
+	searchDir, err := s.ensureSearchDirLocked()
+	if err != nil {
+		return "", err
+	}
+
+	searchPath := filepath.Join(searchDir, searchCacheFilename(ref, path))
+	if _, err := os.Stat(searchPath); err == nil {
+		return searchPath, nil
+	}
+
+	text, err := searchableText(raw, path)
+	if err != nil {
+		return "", err
+	}
+
+	tmpFile, err := os.CreateTemp(searchDir, searchCachePrefix(ref)+"-*.tmp")
+	if err != nil {
+		return "", fmt.Errorf("failed to create ripgrep cache file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer func() {
+		_ = tmpFile.Close()
+	}()
+
+	if _, err := tmpFile.WriteString(text); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to write ripgrep cache file: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to finalize ripgrep cache file: %w", err)
+	}
+	if err := os.Rename(tmpPath, searchPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return "", fmt.Errorf("failed to activate ripgrep cache file: %w", err)
+	}
+
+	return searchPath, nil
+}
+
+func (s *Store) ensureSearchDirLocked() (string, error) {
+	if s.searchDir != "" {
+		if err := os.MkdirAll(s.searchDir, 0755); err != nil {
+			return "", fmt.Errorf("failed to prepare ripgrep cache directory: %w", err)
+		}
+		return s.searchDir, nil
+	}
+
+	if s.diskPath != "" {
+		s.searchDir = filepath.Join(s.diskPath, ".search")
+	} else {
+		dir, err := os.MkdirTemp("", "tldr-rg-cache-*")
+		if err != nil {
+			return "", fmt.Errorf("failed to create ripgrep cache directory: %w", err)
+		}
+		s.searchDir = dir
+	}
+
+	if err := os.MkdirAll(s.searchDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to prepare ripgrep cache directory: %w", err)
+	}
+	return s.searchDir, nil
+}
+
+func searchCachePrefix(ref string) string {
+	return strings.TrimSuffix(refToFilename(ref), ".json")
+}
+
+func searchCacheFilename(ref, path string) string {
+	hash := sha256.Sum256([]byte(path))
+	return fmt.Sprintf("%s--%s.txt", searchCachePrefix(ref), hex.EncodeToString(hash[:8]))
+}
+
+func (s *Store) deleteSearchCache(ref string) {
+	searchDir := s.searchDir
+	if searchDir == "" && s.diskPath != "" {
+		searchDir = filepath.Join(s.diskPath, ".search")
+	}
+	if searchDir == "" {
+		return
+	}
+
+	matches, err := filepath.Glob(filepath.Join(searchDir, searchCachePrefix(ref)+"--*.txt"))
+	if err != nil {
+		return
+	}
+	for _, match := range matches {
+		_ = os.Remove(match)
+	}
+}
+
 // Summary returns metadata about all non-expired stored results.
 func (s *Store) Summary() map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	now := time.Now()
+	s.evictExpired()
+
 	summary := make(map[string]interface{})
 	for ref, r := range s.results {
-		if now.Before(r.ExpiresAt) {
-			entry := map[string]interface{}{
-				"ref":      r.Ref,
-				"server":   r.Server,
-				"tool":     r.Tool,
-				"isError":  r.IsError,
-				"byteSize": r.ByteSize,
-				"duration": r.Duration.String(),
-			}
-			if r.IsArray {
-				entry["arrayLen"] = r.ArrayLen
-			}
-			if r.IsString {
-				entry["stringLen"] = r.StringLen
-			}
-			summary[ref] = entry
+		entry := map[string]interface{}{
+			"ref":      r.Ref,
+			"server":   r.Server,
+			"tool":     r.Tool,
+			"isError":  r.IsError,
+			"byteSize": r.ByteSize,
+			"duration": r.Duration.String(),
 		}
+		if r.IsArray {
+			entry["arrayLen"] = r.ArrayLen
+		}
+		if r.IsString {
+			entry["stringLen"] = r.StringLen
+		}
+		summary[ref] = entry
 	}
 	return summary
 }
 
 // ListRefs returns all non-expired result ref handles.
 func (s *Store) ListRefs() []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
 
-	now := time.Now()
+	s.evictExpired()
+
 	refs := make([]string, 0)
 	for _, ref := range s.order {
-		if r, ok := s.results[ref]; ok && now.Before(r.ExpiresAt) {
+		if _, ok := s.results[ref]; ok {
 			refs = append(refs, ref)
 		}
 	}
@@ -349,6 +564,9 @@ func (s *Store) ListRefs() []string {
 func (s *Store) Clear() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	for ref := range s.results {
+		s.deleteFromDisk(ref)
+	}
 	s.results = make(map[string]*StepResult)
 	s.order = make([]string, 0)
 	s.totalBytes = 0
@@ -409,6 +627,7 @@ func (s *Store) evictExpired() {
 			if now.After(r.ExpiresAt) {
 				s.totalBytes -= r.ByteSize
 				delete(s.results, ref)
+				s.deleteFromDisk(ref)
 				continue
 			}
 		}
@@ -461,6 +680,7 @@ func (s *Store) writeToDisk(result *StepResult) {
 
 // deleteFromDisk removes a result file. Best-effort.
 func (s *Store) deleteFromDisk(ref string) {
+	s.deleteSearchCache(ref)
 	if s.diskPath == "" {
 		return
 	}
@@ -500,7 +720,7 @@ func (s *Store) loadFromDisk() {
 
 		// Skip expired results
 		if now.After(result.ExpiresAt) {
-			_ = os.Remove(path)
+			s.deleteFromDisk(result.Ref)
 			continue
 		}
 
@@ -523,6 +743,40 @@ func (s *Store) loadFromDisk() {
 			}
 		}
 	}
+}
+
+// searchableText renders a stored result as line-oriented text suitable for regex search.
+func searchableText(raw json.RawMessage, path string) (string, error) {
+	var parsed interface{}
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		return string(raw), nil
+	}
+
+	selected := parsed
+	if path != "" {
+		pathExpr := path
+		if pathExpr[0] != '.' && pathExpr[0] != '[' {
+			pathExpr = "." + pathExpr
+		}
+		ops, err := parsePath(pathExpr)
+		if err != nil {
+			return "", fmt.Errorf("invalid search path %q: %w", path, err)
+		}
+		selected, err = navigatePath(parsed, ops)
+		if err != nil {
+			return "", fmt.Errorf("path extraction failed: %w", err)
+		}
+	}
+
+	if str, ok := selected.(string); ok {
+		return str, nil
+	}
+
+	pretty, err := json.MarshalIndent(selected, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to serialize searchable value: %w", err)
+	}
+	return string(pretty), nil
 }
 
 // --- Path parsing ---
