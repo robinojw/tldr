@@ -188,19 +188,45 @@ That is an **~86% reduction** before you even factor in response shielding. The 
 
 The second savings mechanism is **keeping large responses out of the model context**.
 
-When `tldr` executes a tool call, it stores the raw result locally and applies output shielding before returning anything to the harness.
+When `tldr` executes a tool call, it stores the raw result locally and applies three layers of output shielding before returning anything to the harness. The shielding rules come from the default policy config in `pkg/config/config.go:64-92` and the enforcement logic in `internal/policy/policy.go`.
 
-The shielding rules come from the default policy config in `pkg/config/config.go:64-89` and the enforcement logic in `internal/policy/policy.go:26-110` and `internal/policy/policy.go:173-212`.
+#### Layer 1: Smart array compaction
 
-By default, the shielding policy combines a byte budget with structural trimming:
+When a response is a JSON array of objects (the most common shape from GitHub, search APIs, etc.), `tldr` automatically detects and strips "heavy" fields while preserving "signal" fields.
 
-- byte-oriented output is targeted to stay within **64 KB**
-- arrays are capped at **50 elements**
-- strings are capped at **8192 characters**
+The compaction engine samples up to 10 array elements and classifies each field as heavy or light based on:
 
-If a result is too large, `tldr` truncates what the model sees and returns structured metadata showing that more data exists. The raw payload stays in the local result store, which is why truncation is a **defer-load** mechanism rather than blind loss.
+- **Average serialized size** exceeding `maxFieldBytes` (default 256 bytes)
+- **URL detection** — any `https://...` value over 40 bytes
+- **Nested objects/arrays** larger than `maxFieldBytes / 2`
 
-For a concrete response-size example, I ran a representative **200-item GitHub-style issues payload** through the same default shielding path. The raw JSON was about **312,877 bytes**, and the shielded result returned to the model was about **85,620 bytes**.
+Signal fields like `id`, `name`, `title`, `sha`, `message`, `description`, `state`, `created_at`, `path`, and `body` are **never stripped** regardless of size. Stripped fields are listed in an `_omitted` array so the model knows they exist and can fetch them via `get_result`.
+
+That logic lives in `internal/policy/policy.go:209-364`.
+
+For a concrete example, a typical GitHub `list_commits` response with 11 commits contains ~8,200 bytes of raw JSON. Most of that is URLs (`html_url`, `git_url`, `avatar_url`, `profile_url`, `download_url`) and nested author/committer objects. After smart compaction, the model sees ~1,800 bytes — just the sha, commit message, and dates — an **~78% reduction** at the field level before any byte or token limits even apply.
+
+#### Layer 2: Token-aware shielding
+
+Responses are capped at `maxOutputTokens` (default **4,096 tokens**, ~16 KB) even if they are under the byte limit. This catches the common case where a response is technically under 64 KB but still wastes thousands of tokens of model context.
+
+The effective limit is `min(maxOutputTokens * 4, maxOutputBytes)`. Token estimation uses a conservative 4 characters per token. The enforcement logic is in `internal/policy/policy.go:40-66`.
+
+#### Layer 3: Byte-level truncation
+
+As a safety net, the hard cap at `maxOutputBytes` (default **64 KB**) applies after smart compaction and token-aware shielding. Arrays are capped at **50 elements** and strings at **8,192 characters**.
+
+If a result is too large after all three layers, `tldr` truncates what the model sees and returns structured metadata showing that more data exists. The raw payload stays in the local result store, which is why truncation is a **defer-load** mechanism rather than blind loss.
+
+#### Combined effect
+
+For a representative **200-item GitHub-style issues payload**, the raw JSON is about **312,877 bytes** (~78,219 tokens). After all three shielding layers:
+
+1. Smart compaction strips URLs and nested objects from each element
+2. Token-aware shielding caps the output at ~16 KB
+3. Array trimming reduces the element count to fit within the token budget
+
+The shielded result returned to the model is about **15,800 bytes** (~3,950 tokens).
 
 ```mermaid
 ---
@@ -210,13 +236,13 @@ config:
     showDataLabelOutsideBar: true
 ---
 xychart-beta
-    title "Approximate response footprint after shielding"
-    x-axis ["Raw JSON response", "Shielded model-visible response"]
-    y-axis "Bytes" 0 --> 330000
-    bar [312877, 85620]
+    title "Response token footprint after shielding"
+    x-axis ["Raw response", "After compaction + token limit"]
+    y-axis "Approximate tokens" 0 --> 85000
+    bar [78219, 3950]
 ```
 
-That is an **~73% reduction** before the model does any follow-up paging with `get_result`. In this kind of large array response, the biggest savings come from the default policy trimming the top-level payload down to 50 summarized items while keeping the full raw result available locally.
+That is an **~95% token reduction** before the model does any follow-up paging with `get_result`. The full raw result remains available locally — the model can page through it, project specific fields, or run ripgrep against it at any time.
 
 ## How intermediate data stays out of the prompt
 
@@ -380,17 +406,20 @@ Key paths include:
 - backups: `pkg/config/config.go:143-146`
 - logs: `pkg/config/config.go:148-151`
 
-Default policy values are defined in `pkg/config/config.go:77-89`:
+Default policy values are defined in `pkg/config/config.go:80-95`:
 
-| Setting | Default |
-| --- | --- |
-| `maxOutputBytes` | `65536` |
-| `maxArrayLength` | `50` |
-| `maxStringLength` | `8192` |
-| `stepTimeout` | `30s` |
-| `planTimeout` | `120s` |
-| `maxSteps` | `10` |
-| `allowMutating` | `false` |
+| Setting | Default | Description |
+| --- | --- | --- |
+| `maxOutputBytes` | `65536` | Hard byte cap on shielded output |
+| `maxOutputTokens` | `4096` | Approximate token budget (~16 KB) |
+| `maxArrayLength` | `50` | Max array elements before truncation |
+| `maxStringLength` | `8192` | Max string length before truncation |
+| `maxFieldBytes` | `256` | Auto-compact fields larger than this |
+| `compactArrays` | `true` | Smart field stripping for array responses |
+| `stepTimeout` | `30s` | Per-step execution timeout |
+| `planTimeout` | `120s` | Total plan execution timeout |
+| `maxSteps` | `10` | Max steps per plan |
+| `allowMutating` | `false` | Whether write/dangerous tools are permitted |
 
 ## Project layout
 
@@ -399,7 +428,7 @@ Core packages:
 - `internal/wrapper/` — the 5-tool MCP wrapper server
 - `internal/compiler/` — raw tool schema -> compressed capability index
 - `internal/executor/` — structured multi-step execution and ref handling
-- `internal/policy/` — output shielding and safety controls
+- `internal/policy/` — output shielding: smart compaction, token-aware limits, and safety controls
 - `internal/resultstore/` — local result persistence, pagination, projection
 - `internal/registry/` — upstream server registry and policy config
 - `internal/harness/` — harness adapters for install/migrate/rollback
