@@ -2,6 +2,12 @@
 
 `tldr` is a local MCP gateway for coding harnesses.
 
+Install it with:
+
+```sh
+curl -sSfL https://raw.githubusercontent.com/robinojw/tldr/main/install.sh | sh
+```
+
 It sits between your harness and your upstream MCP servers, replaces a large tool surface with 5 wrapper tools, keeps large intermediate payloads out of the model context, and lets the model page through stored results only when it actually needs them.
 
 In practice, `tldr` is trying to solve two very specific problems:
