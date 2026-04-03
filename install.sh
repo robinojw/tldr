@@ -122,9 +122,9 @@ build_from_source() {
 
     if command -v git >/dev/null 2>&1; then
         info "Cloning repository..."
-        git clone --depth 1 "https://github.com/${REPO}.git" "${TMPDIR}/tldr" 2>/dev/null
+        git clone --depth 1 "https://github.com/${REPO}.git" "${TMPDIR}/src" 2>/dev/null
         (
-            cd "${TMPDIR}/tldr"
+            cd "${TMPDIR}/src"
             go build -o "${TMPDIR}/${BINARY}" ./cmd/tldr
         )
     else
