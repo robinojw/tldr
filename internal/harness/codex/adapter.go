@@ -123,8 +123,10 @@ func (a *Adapter) InstallWrapper(ctx context.Context, scope harness.Scope) error
 		}
 	}
 
-	// Add tldr entry
-	cfg.MCPServers["tldr"] = harness.TldrServerEntry()
+	// Replace all existing servers with just tldr
+	cfg.MCPServers = map[string]*config.HarnessMCPServer{
+		"tldr": harness.TldrServerEntry(),
+	}
 
 	// Save
 	if err := a.SaveConfig(ctx, scope, cfg); err != nil {

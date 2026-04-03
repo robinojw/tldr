@@ -132,7 +132,10 @@ func (a *Adapter) InstallWrapper(ctx context.Context, scope harness.Scope) error
 	if err != nil {
 		cfg = &config.HarnessMCPConfig{MCPServers: make(map[string]*config.HarnessMCPServer)}
 	}
-	cfg.MCPServers["tldr"] = harness.TldrServerEntry()
+	// Replace all existing servers with just tldr
+	cfg.MCPServers = map[string]*config.HarnessMCPServer{
+		"tldr": harness.TldrServerEntry(),
+	}
 
 	if err := a.SaveConfig(ctx, scope, cfg); err != nil {
 		return fmt.Errorf("failed to install tldr in opencode config: %w", err)
