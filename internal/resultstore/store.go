@@ -28,7 +28,7 @@ import (
 )
 
 // Default TTL for stored results.
-const DefaultTTL = 10 * time.Minute
+const DefaultTTL = 1 * time.Minute
 
 // DefaultMaxStorageBytes caps total memory used by the store.
 const DefaultMaxStorageBytes = 128 * 1024 * 1024 // 128MB
