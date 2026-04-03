@@ -29,14 +29,15 @@ func newHarnessDetectCmd() *cobra.Command {
 
 			if len(found) == 0 {
 				fmt.Println("No supported coding harnesses detected.")
-				fmt.Println("Supported: forge, claude, codex")
+				fmt.Println("Supported: forge, claude, codex, opencode")
 				return nil
 			}
 
 			fmt.Printf("Detected %d harness(es):\n", len(found))
 			for _, a := range found {
-				path, _ := a.ConfigPath(ctx)
-				fmt.Printf("  - %s (config: %s)\n", a.Name(), path)
+				globalPath, _ := a.ConfigPath(ctx, harness.ScopeGlobal)
+				localPath, _ := a.ConfigPath(ctx, harness.ScopeLocal)
+				fmt.Printf("  - %s (global: %s, local: %s)\n", a.Name(), globalPath, localPath)
 			}
 			return nil
 		},

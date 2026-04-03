@@ -130,7 +130,7 @@ build_from_source() {
     else
         # go install fallback
         info "Installing via go install..."
-        GOBIN="${TMPDIR}" go install "github.com/${REPO./cmd/tldr@latest"
+        GOBIN="${TMPDIR}" go install "github.com/${REPO}/cmd/tldr@latest"
     fi
 
     if [ ! -f "${TMPDIR}/${BINARY}" ]; then

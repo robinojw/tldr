@@ -6,6 +6,7 @@ import (
 	"github.com/robinojw/tldr/internal/harness/claude"
 	"github.com/robinojw/tldr/internal/harness/codex"
 	"github.com/robinojw/tldr/internal/harness/forge"
+	"github.com/robinojw/tldr/internal/harness/opencode"
 	"github.com/spf13/cobra"
 )
 
@@ -15,6 +16,7 @@ func AllAdapters() []harness.Adapter {
 		&forge.Adapter{},
 		&claude.Adapter{},
 		&codex.Adapter{},
+		&opencode.Adapter{},
 	}
 }
 
@@ -28,7 +30,7 @@ by replacing many upstream MCP tools with a small wrapper surface and prevents
 large intermediate API responses from reaching the model.
 
 Instead of exposing dozens of MCP tools directly to your coding harness (Claude Code,
-ForgeCode, Codex), tldr sits in between and provides 5 tools:
+ForgeCode, Codex, OpenCode), tldr sits in between and provides 5 tools:
   - search_tools: discover capabilities across all registered servers
   - execute_plan: run multi-step plans with response shielding  
   - call_raw: direct tool calls (escape hatch)

@@ -4,7 +4,9 @@ go 1.25.4
 
 require (
 	github.com/mark3labs/mcp-go v0.46.0
+	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/spf13/cobra v1.10.2
+	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd
 )
 
 require (

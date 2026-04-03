@@ -5,9 +5,30 @@ package harness
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/robinojw/tldr/pkg/config"
 )
+
+// Scope controls whether tldr writes harness config globally or locally.
+type Scope string
+
+const (
+	ScopeGlobal Scope = "global"
+	ScopeLocal  Scope = "local"
+)
+
+// ParseScope normalizes CLI scope values into the two supported scopes.
+func ParseScope(raw string) (Scope, error) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "", string(ScopeGlobal), "user":
+		return ScopeGlobal, nil
+	case string(ScopeLocal), "project":
+		return ScopeLocal, nil
+	default:
+		return "", fmt.Errorf("unsupported scope: %s", raw)
+	}
+}
 
 // Adapter is the interface each coding harness must implement.
 type Adapter interface {
@@ -18,19 +39,19 @@ type Adapter interface {
 	Detect(ctx context.Context) (bool, error)
 
 	// ConfigPath returns the path to the harness's MCP config file.
-	ConfigPath(ctx context.Context) (string, error)
+	ConfigPath(ctx context.Context, scope Scope) (string, error)
 
 	// LoadConfig reads the harness's MCP configuration.
-	LoadConfig(ctx context.Context) (*config.HarnessMCPConfig, error)
+	LoadConfig(ctx context.Context, scope Scope) (*config.HarnessMCPConfig, error)
 
 	// SaveConfig writes the harness's MCP configuration.
-	SaveConfig(ctx context.Context, cfg *config.HarnessMCPConfig) error
+	SaveConfig(ctx context.Context, scope Scope, cfg *config.HarnessMCPConfig) error
 
 	// InstallWrapper injects tldr as the single MCP server in the harness.
-	InstallWrapper(ctx context.Context) error
+	InstallWrapper(ctx context.Context, scope Scope) error
 
 	// Rollback restores the harness config from the latest backup.
-	Rollback(ctx context.Context) error
+	Rollback(ctx context.Context, scope Scope) error
 
 	// Reload triggers the harness to reload its MCP configuration if supported.
 	Reload(ctx context.Context) error
@@ -59,6 +80,7 @@ func TldrServerEntry() *config.HarnessMCPServer {
 	return &config.HarnessMCPServer{
 		Command: "tldr",
 		Args:    []string{"serve"},
+		Type:    "stdio",
 	}
 }
 

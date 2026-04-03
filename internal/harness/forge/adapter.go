@@ -1,5 +1,6 @@
 // Package forge implements the harness adapter for ForgeCode.
-// ForgeCode uses .mcp.json files at user (~/.forge/.mcp.json) and local (cwd/.mcp.json) scopes.
+// ForgeCode uses .mcp.json at the project root for local scope
+// and ~/forge/.mcp.json for global scope.
 package forge
 
 import (
@@ -31,32 +32,38 @@ func (a *Adapter) Detect(ctx context.Context) (bool, error) {
 		return true, nil
 	}
 
-	// Check for config directory
+	// Check for config directories
 	home, _ := os.UserHomeDir()
-	forgePath := filepath.Join(home, ".forge")
-	if info, err := os.Stat(forgePath); err == nil && info.IsDir() {
-		log.Debug("detected forge config dir: %s", forgePath)
-		return true, nil
+	for _, dir := range []string{filepath.Join(home, "forge"), filepath.Join(home, ".forge")} {
+		if info, err := os.Stat(dir); err == nil && info.IsDir() {
+			log.Debug("detected forge config dir: %s", dir)
+			return true, nil
+		}
 	}
 
 	return false, nil
 }
 
-func (a *Adapter) ConfigPath(ctx context.Context) (string, error) {
-	// Prefer local .mcp.json, then user-level
-	cwd, _ := os.Getwd()
-	localPath := filepath.Join(cwd, ".mcp.json")
-	if _, err := os.Stat(localPath); err == nil {
-		return localPath, nil
+func (a *Adapter) ConfigPath(ctx context.Context, scope harness.Scope) (string, error) {
+	if scope == harness.ScopeLocal {
+		cwd, _ := os.Getwd()
+		return filepath.Join(cwd, ".mcp.json"), nil
 	}
 
 	home, _ := os.UserHomeDir()
-	userPath := filepath.Join(home, ".forge", ".mcp.json")
-	return userPath, nil
+	preferred := filepath.Join(home, "forge", ".mcp.json")
+	legacy := filepath.Join(home, ".forge", ".mcp.json")
+	if _, err := os.Stat(preferred); err == nil {
+		return preferred, nil
+	}
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy, nil
+	}
+	return preferred, nil
 }
 
-func (a *Adapter) LoadConfig(ctx context.Context) (*config.HarnessMCPConfig, error) {
-	path, err := a.ConfigPath(ctx)
+func (a *Adapter) LoadConfig(ctx context.Context, scope harness.Scope) (*config.HarnessMCPConfig, error) {
+	path, err := a.ConfigPath(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -74,16 +81,16 @@ func (a *Adapter) LoadConfig(ctx context.Context) (*config.HarnessMCPConfig, err
 	return cfg, nil
 }
 
-func (a *Adapter) SaveConfig(ctx context.Context, cfg *config.HarnessMCPConfig) error {
-	path, err := a.ConfigPath(ctx)
+func (a *Adapter) SaveConfig(ctx context.Context, scope harness.Scope, cfg *config.HarnessMCPConfig) error {
+	path, err := a.ConfigPath(ctx, scope)
 	if err != nil {
 		return err
 	}
 	return config.SaveJSON(path, cfg)
 }
 
-func (a *Adapter) InstallWrapper(ctx context.Context) error {
-	path, err := a.ConfigPath(ctx)
+func (a *Adapter) InstallWrapper(ctx context.Context, scope harness.Scope) error {
+	path, err := a.ConfigPath(ctx, scope)
 	if err != nil {
 		return err
 	}
@@ -96,7 +103,7 @@ func (a *Adapter) InstallWrapper(ctx context.Context) error {
 	}
 
 	// Load existing config
-	cfg, err := a.LoadConfig(ctx)
+	cfg, err := a.LoadConfig(ctx, scope)
 	if err != nil {
 		cfg = &config.HarnessMCPConfig{
 			MCPServers: make(map[string]*config.HarnessMCPServer),
@@ -107,11 +114,11 @@ func (a *Adapter) InstallWrapper(ctx context.Context) error {
 	cfg.MCPServers["tldr"] = harness.TldrServerEntry()
 
 	// Save
-	if err := a.SaveConfig(ctx, cfg); err != nil {
+	if err := a.SaveConfig(ctx, scope, cfg); err != nil {
 		return fmt.Errorf("failed to install tldr in forge: %w", err)
 	}
 
-	log.Info("installed tldr wrapper in forge config: %s", path)
+	log.Info("installed tldr wrapper in forge %s config: %s", scope, path)
 
 	// Try to reload
 	_ = a.Reload(ctx)
@@ -119,8 +126,8 @@ func (a *Adapter) InstallWrapper(ctx context.Context) error {
 	return nil
 }
 
-func (a *Adapter) Rollback(ctx context.Context) error {
-	path, err := a.ConfigPath(ctx)
+func (a *Adapter) Rollback(ctx context.Context, scope harness.Scope) error {
+	path, err := a.ConfigPath(ctx, scope)
 	if err != nil {
 		return err
 	}

@@ -2,13 +2,108 @@
 
 `tldr` is a local MCP gateway for coding harnesses.
 
+It sits between your harness and your upstream MCP servers, replaces a large tool surface with 5 wrapper tools, keeps large intermediate payloads out of the model context, and lets the model page through stored results only when it actually needs them.
+
+Useful links:
+
+- [Quick setup](#quick-setup)
+- [Migrate an existing harness](#migrate-an-existing-harness-into-tldr)
+- [Add MCPs to `tldr`](#add-mcps-to-tldr)
+- [What `tldr` actually changes](#what-tldr-actually-changes)
+- [How this reduces MCP token usage](#how-this-reduces-mcp-token-usage)
+- [CLI workflow](#cli-workflow)
+
+## Quick setup
+
 Install it with:
 
 ```sh
 curl -sSfL https://raw.githubusercontent.com/robinojw/tldr/main/install.sh | sh
 ```
 
-It sits between your harness and your upstream MCP servers, replaces a large tool surface with 5 wrapper tools, keeps large intermediate payloads out of the model context, and lets the model page through stored results only when it actually needs them.
+`tldr` currently has harness adapters for **Claude Code**, **Codex**, **ForgeCode**, and **OpenCode**: `internal/cli/root.go:12-19`.
+
+### Migrate an existing harness into `tldr`
+
+If you already have MCP servers configured in Claude Code, Codex, ForgeCode, or OpenCode, the fastest path is `tldr migrate`.
+
+By default, `tldr` now reads from and rewrites the **global** harness config. To migrate the global MCP servers from **Claude Code** into `tldr` and rewrite that harness config so it points only at `tldr serve`:
+
+```sh
+tldr migrate --harness claude
+```
+
+To do the same for **Codex**, **ForgeCode**, or **OpenCode**:
+
+```sh
+tldr migrate --harness codex
+tldr migrate --harness forge
+tldr migrate --harness opencode
+```
+
+If you want to migrate the **current project's local config** instead of the global one, add `--scope local`:
+
+```sh
+tldr migrate --harness claude --scope local
+```
+
+To let `tldr` detect and migrate every supported harness it finds on the machine:
+
+```sh
+tldr migrate
+```
+
+That command reads the selected harness MCP config, imports each non-`tldr` server into `tldr`'s registry, backs up the original config, and rewrites the harness config to a single `tldr` entry: `internal/cli/migrate_cmd.go:18-185`.
+
+### Add MCPs to `tldr`
+
+If you are starting fresh, or you want to register upstream MCP servers directly with `tldr`, the flow is:
+
+```sh
+tldr mcp add --transport stdio github npx -- -y @modelcontextprotocol/server-github
+tldr wrap github
+tldr install --harness claude
+```
+
+The important part is that the add command is intentionally shaped like the harness-native flow. If you are used to `claude mcp add`, the mental model is the same: **replace `claude` with `tldr`** and register the server with `tldr` instead of directly with the harness.
+
+```sh
+claude mcp add github npx -y @modelcontextprotocol/server-github
+tldr mcp add --transport stdio github npx -- -y @modelcontextprotocol/server-github
+```
+
+After that, `tldr wrap github` builds the capability index, and `tldr install --harness claude` adds `tldr serve` to the harness's **global** config by default. Add `--scope local` if you want the current project's local harness config instead.
+
+```sh
+tldr install --harness claude --scope local
+```
+
+You can swap `claude` for `codex`, `forge`, or `opencode`: `internal/cli/mcp_cmd.go:37-90`, `internal/cli/wrap_cmd.go:15-82`, `internal/cli/install_cmd.go:13-121`.
+
+If you just want to see what `tldr` can manage on the current machine:
+
+```sh
+tldr harness detect
+```
+
+### Where `tldr` writes harness config
+
+By default, `tldr install` writes to the **global** harness config. Use `--scope local` to target the current project's local harness config instead.
+
+- **Claude Code**:
+  - global: `~/.claude.json`
+  - local: `./.mcp.json`
+- **Codex**:
+  - global: `~/.codex/config.toml`
+  - local: `./.mcp.json`
+- **ForgeCode**:
+  - global: `~/forge/.mcp.json`
+  - local: `./.mcp.json`
+- **OpenCode**:
+  - global: `~/.config/opencode/opencode.json`
+  - local: `./opencode.json`
+
+Those paths come from the harness adapters in `internal/harness/claude/adapter.go:46-102`, `internal/harness/codex/adapter.go:46-102`, `internal/harness/forge/adapter.go:45-89`, and `internal/harness/opencode/adapter.go:49-72`.
 
 In practice, `tldr` is trying to solve two very specific problems:
 
@@ -27,11 +122,11 @@ With `tldr`, the harness points to a single MCP server entry:
 
 That wrapper only exposes these 5 tools:
 
-1. `search_tools`
-2. `execute_plan`
-3. `call_raw`
-4. `inspect_tool`
-5. `get_result`
+1. `search_tools` — search the compiled capability index and discover relevant upstream tools without loading full schemas.
+2. `execute_plan` — run a structured multi-step plan across upstream servers, with dependency-aware execution and shielded final output.
+3. `call_raw` — call one upstream tool directly when a full plan would be unnecessary.
+4. `inspect_tool` — inspect one specific upstream tool in more detail before calling it.
+5. `get_result` — page through, project, or ripgrep stored results when a prior response was truncated.
 
 Those 5 tools are registered directly by the wrapper server in `internal/wrapper/server.go:100-203`, and the harness integration writes `tldr serve` into the harness config in `internal/harness/harness.go:57-63`.
 
@@ -189,75 +284,6 @@ The slicing and projection logic lives in `internal/resultstore/store.go:214-302
 
 So the model does **not** need the full 500 KB response in its prompt. It gets a smaller first view, then requests only the next page, the specific fields it needs, or a ripgrep-matched snippet from the stored payload.
 
-## How the “sandboxing” works
-
-If you describe `tldr` as “sandboxing,” the important thing to understand is that this is **not** an operating-system sandbox and **not** arbitrary code execution.
-
-`tldr` does not run model-generated code. It accepts structured plans and forwards calls only to registered MCP tools. The core safety model is:
-
-### 1) Structured execution only
-
-The model cannot send arbitrary programs to run inside `tldr`.
-
-It can only:
-
-- search capabilities
-- inspect a stored capability
-- submit a JSON plan
-- make a direct raw tool call
-- fetch paginated stored results
-
-The wrapper instructions themselves describe that workflow in `internal/wrapper/server.go:501-519`.
-
-### 2) The model is limited to registered MCP servers
-
-`tldr serve` opens the local registry, connects only to wrapped servers, merges their capability indexes, and then serves the 5-tool wrapper on stdio. That startup path is in `internal/cli/serve_cmd.go:34-105` and the registry behavior is in `internal/registry/registry.go:24-118`.
-
-So the model is constrained to the upstream servers you registered with `tldr mcp add` and marked for wrapping with `tldr wrap`.
-
-### 3) Mutating tools are blocked by default
-
-The default policy sets `AllowMutating` to `false` in `pkg/config/config.go:77-89`.
-
-Before `execute_plan` runs any step, and before `call_raw` executes any tool, `tldr` checks whether the tool is:
-
-- explicitly blocked
-- classified as `write`
-- classified as `dangerous`
-
-Those checks happen in `internal/executor/executor.go:144-167` for plans and `internal/executor/executor.go:355-367` for raw calls.
-
-Risk classification comes from the compiled capability index in `internal/compiler/compiler.go:20-30`, or from a name-based fallback heuristic in `internal/executor/executor.go:474-499`.
-
-In other words: by default, the model is effectively in a **read-mostly execution sandbox** unless you explicitly permit mutating tools.
-
-### 4) Additional policy controls exist
-
-The policy layer also supports:
-
-- blocked tool names
-- per-step timeout
-- plan timeout
-- maximum step count
-
-Those policy fields are defined in `pkg/config/config.go:64-75`, and the executor enforces the plan and step limits in `internal/executor/executor.go:121-132` and `internal/executor/executor.go:265-268`.
-
-So the sandboxing model is really a combination of:
-
-- a tiny wrapper tool surface
-- no arbitrary code execution
-- only registered upstream servers
-- read-only by default
-- explicit blocklists
-- time and size limits
-- local result containment
-
-### 5) Data containment is local to `tldr`
-
-Raw upstream responses are intentionally kept inside the local result store instead of being forwarded to the model. That design is described in `internal/resultstore/store.go:1-12` and enforced during execution in `internal/executor/executor.go:287-310` and `internal/executor/executor.go:379-390`.
-
-So “sandboxing” here also means **the model gets a filtered view of tool output, not the whole raw payload by default**.
-
 ## What `inspect_tool` does and does not do
 
 One subtle but important detail: `inspect_tool` does **not** fetch and return the full original upstream JSON Schema.
@@ -339,8 +365,9 @@ The current adapters are:
 - Forge
 - Claude Code
 - Codex
+- OpenCode
 
-They are registered in `internal/cli/root.go:12-18`.
+They are registered in `internal/cli/root.go:12-19`.
 
 ## Configuration and storage
 

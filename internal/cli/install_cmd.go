@@ -11,19 +11,27 @@ import (
 )
 
 func newInstallCmd() *cobra.Command {
-	var harnessName string
+	var (
+		harnessName string
+		scopeRaw    string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "install",
 		Short: "Install tldr wrapper into a coding harness",
 		Long: `Inject tldr as the MCP server in the specified harness's configuration.
-The harness will only see tldr's 4 tools (search_tools, execute_plan,
-call_raw, inspect_tool) instead of all the raw upstream MCP tools.`,
+The harness will only see tldr's 5 tools (search_tools, execute_plan,
+call_raw, inspect_tool, get_result) instead of all the raw upstream MCP tools.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			adapters := AllAdapters()
 
 			adapter, err := harness.Get(harnessName, adapters)
+			if err != nil {
+				return err
+			}
+
+			scope, err := harness.ParseScope(scopeRaw)
 			if err != nil {
 				return err
 			}
@@ -35,7 +43,7 @@ call_raw, inspect_tool) instead of all the raw upstream MCP tools.`,
 			}
 
 			// Install the wrapper
-			if err := adapter.InstallWrapper(ctx); err != nil {
+			if err := adapter.InstallWrapper(ctx, scope); err != nil {
 				return fmt.Errorf("failed to install: %w", err)
 			}
 
@@ -44,7 +52,7 @@ call_raw, inspect_tool) instead of all the raw upstream MCP tools.`,
 			if err != nil {
 				fmt.Printf("Warning: failed to open registry: %v\n", err)
 			} else {
-				path, _ := adapter.ConfigPath(ctx)
+				path, _ := adapter.ConfigPath(ctx, scope)
 				wrapped := reg.WrappedServers()
 				serverNames := make([]string, len(wrapped))
 				for i, s := range wrapped {
@@ -57,21 +65,27 @@ call_raw, inspect_tool) instead of all the raw upstream MCP tools.`,
 				})
 			}
 
-			fmt.Printf("Tldr installed in %s.\n", harnessName)
+			path, _ := adapter.ConfigPath(ctx, scope)
+			fmt.Printf("Tldr installed in %s (%s scope).\n", harnessName, scope)
+			fmt.Printf("Config updated: %s\n", path)
 			fmt.Println("The harness now sees only tldr's compressed tool surface.")
-			fmt.Println("Use 'tldr rollback --harness " + harnessName + "' to undo.")
+			fmt.Println("Use 'tldr rollback --harness " + harnessName + " --scope " + string(scope) + "' to undo.")
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&harnessName, "harness", "", "Target harness (forge, claude, codex)")
+	cmd.Flags().StringVar(&harnessName, "harness", "", "Target harness (forge, claude, codex, opencode)")
+	cmd.Flags().StringVar(&scopeRaw, "scope", "global", "Install scope (global or local)")
 	cmd.MarkFlagRequired("harness")
 
 	return cmd
 }
 
 func newRollbackCmd() *cobra.Command {
-	var harnessName string
+	var (
+		harnessName string
+		scopeRaw    string
+	)
 
 	cmd := &cobra.Command{
 		Use:   "rollback",
@@ -85,16 +99,22 @@ func newRollbackCmd() *cobra.Command {
 				return err
 			}
 
-			if err := adapter.Rollback(ctx); err != nil {
+			scope, err := harness.ParseScope(scopeRaw)
+			if err != nil {
+				return err
+			}
+
+			if err := adapter.Rollback(ctx, scope); err != nil {
 				return fmt.Errorf("rollback failed: %w", err)
 			}
 
-			fmt.Printf("Rolled back %s config to pre-tldr state.\n", harnessName)
+			fmt.Printf("Rolled back %s %s config to pre-tldr state.\n", harnessName, scope)
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&harnessName, "harness", "", "Target harness (forge, claude, codex)")
+	cmd.Flags().StringVar(&harnessName, "harness", "", "Target harness (forge, claude, codex, opencode)")
+	cmd.Flags().StringVar(&scopeRaw, "scope", "global", "Rollback scope (global or local)")
 	cmd.MarkFlagRequired("harness")
 
 	return cmd

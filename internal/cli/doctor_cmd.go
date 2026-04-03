@@ -124,16 +124,16 @@ func newDoctorCmd() *cobra.Command {
 			adapters := AllAdapters()
 			found := harness.DetectAll(ctx, adapters)
 			for _, a := range found {
-				path, _ := a.ConfigPath(ctx)
-				fmt.Printf("  [OK]   %s (config: %s)\n", a.Name(), path)
+				globalPath, _ := a.ConfigPath(ctx, harness.ScopeGlobal)
+				fmt.Printf("  [OK]   %s (global config: %s)\n", a.Name(), globalPath)
 
-				// Check if tldr is installed in this harness
-				cfg, err := a.LoadConfig(ctx)
+				// Check if tldr is installed in this harness's global config
+				cfg, err := a.LoadConfig(ctx, harness.ScopeGlobal)
 				if err == nil {
 					if _, hasTldr := cfg.MCPServers["tldr"]; hasTldr {
-						fmt.Printf("         - tldr is installed\n")
+						fmt.Printf("         - tldr is installed globally\n")
 					} else {
-						fmt.Printf("         - tldr NOT installed (run 'tldr install --harness %s')\n", a.Name())
+						fmt.Printf("         - tldr NOT installed globally (run 'tldr install --harness %s')\n", a.Name())
 					}
 				}
 			}

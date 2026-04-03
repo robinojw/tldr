@@ -19,6 +19,7 @@ func newMigrateCmd() *cobra.Command {
 	var (
 		harnessName string
 		dryRun      bool
+		scopeRaw    string
 	)
 
 	cmd := &cobra.Command{
@@ -36,6 +37,11 @@ MCP setup with tldr's compressed surface.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			adapters := AllAdapters()
+
+			scope, err := harness.ParseScope(scopeRaw)
+			if err != nil {
+				return err
+			}
 
 			var targets []harness.Adapter
 			if harnessName != "" {
@@ -65,10 +71,10 @@ MCP setup with tldr's compressed surface.`,
 					continue
 				}
 
-				path, _ := adapter.ConfigPath(ctx)
-				fmt.Printf("\n--- %s (%s) ---\n", adapter.Name(), path)
+				path, _ := adapter.ConfigPath(ctx, scope)
+				fmt.Printf("\n--- %s (%s, %s scope) ---\n", adapter.Name(), path, scope)
 
-				cfg, err := adapter.LoadConfig(ctx)
+				cfg, err := adapter.LoadConfig(ctx, scope)
 				if err != nil {
 					fmt.Printf("  Failed to load config: %v\n", err)
 					continue
@@ -131,10 +137,10 @@ MCP setup with tldr's compressed surface.`,
 						"tldr": harness.TldrServerEntry(),
 					},
 				}
-				if err := adapter.SaveConfig(ctx, newCfg); err != nil {
+				if err := adapter.SaveConfig(ctx, scope, newCfg); err != nil {
 					fmt.Printf("  Failed to rewrite config: %v\n", err)
 					fmt.Println("  Your original servers are imported into tldr but the harness config was not updated.")
-					fmt.Println("  Run 'tldr install --harness " + adapter.Name() + "' to complete the migration.")
+					fmt.Println("  Run 'tldr install --harness " + adapter.Name() + " --scope " + string(scope) + "' to complete the migration.")
 					continue
 				}
 
@@ -165,14 +171,15 @@ MCP setup with tldr's compressed surface.`,
 			if totalImported > 0 {
 				fmt.Printf("\nDone. Imported %d servers total.\n", totalImported)
 				fmt.Println("Run 'tldr mcp list' to see them.")
-				fmt.Println("Run 'tldr rollback --harness <name>' to undo any harness.")
+				fmt.Println("Run 'tldr rollback --harness <name> --scope " + string(scope) + "' to undo any harness.")
 			}
 			return nil
 		},
 	}
 
-	cmd.Flags().StringVar(&harnessName, "harness", "", "Migrate from a specific harness only (forge, claude, codex)")
+	cmd.Flags().StringVar(&harnessName, "harness", "", "Migrate from a specific harness only (forge, claude, codex, opencode)")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be migrated without making changes")
+	cmd.Flags().StringVar(&scopeRaw, "scope", "global", "Migration scope (global or local)")
 
 	return cmd
 }
