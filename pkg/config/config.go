@@ -64,9 +64,12 @@ type WrapperEntry struct {
 // PolicyConfig defines output shielding and safety policies.
 type PolicyConfig struct {
 	MaxOutputBytes   int      `json:"maxOutputBytes"`
+	MaxOutputTokens  int      `json:"maxOutputTokens"`  // approximate token limit (1 token ~ 4 chars)
 	MaxArrayLength   int      `json:"maxArrayLength"`
 	MaxStringLength  int      `json:"maxStringLength"`
-	StepTimeout      int      `json:"stepTimeout"`      // seconds per step
+	MaxFieldBytes    int      `json:"maxFieldBytes"`     // auto-compact fields larger than this in array elements
+	CompactArrays    bool     `json:"compactArrays"`     // auto-strip heavy fields from array-of-object responses
+	StepTimeout      int      `json:"stepTimeout"`       // seconds per step
 	PlanTimeout      int      `json:"planTimeout"`       // seconds per plan
 	MaxSteps         int      `json:"maxSteps"`
 	AllowMutating    bool     `json:"allowMutating"`
@@ -78,8 +81,11 @@ type PolicyConfig struct {
 func DefaultPolicyConfig() *PolicyConfig {
 	return &PolicyConfig{
 		MaxOutputBytes:  64 * 1024, // 64KB
+		MaxOutputTokens: 4096,      // ~16KB of text
 		MaxArrayLength:  50,
 		MaxStringLength: 8192,
+		MaxFieldBytes:   256,       // auto-compact fields larger than this
+		CompactArrays:   true,      // auto-strip heavy fields from arrays
 		StepTimeout:     30,
 		PlanTimeout:     120,
 		MaxSteps:        10,
