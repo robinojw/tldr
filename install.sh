@@ -125,7 +125,9 @@ build_from_source() {
         git clone --depth 1 "https://github.com/${REPO}.git" "${TMPDIR}/src" 2>/dev/null
         (
             cd "${TMPDIR}/src"
-            go build -o "${TMPDIR}/${BINARY}" ./cmd/tldr
+            COMMIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+            go build -ldflags "-s -w -X github.com/robinojw/tldr/pkg/config.Version=dev-${COMMIT_SHA}" \
+                -o "${TMPDIR}/${BINARY}" ./cmd/tldr
         )
     else
         # go install fallback

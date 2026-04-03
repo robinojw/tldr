@@ -47,6 +47,8 @@ ForgeCode, Codex, OpenCode), tldr sits in between and provides 5 tools:
 		newMigrateCmd(),
 		newDoctorCmd(),
 		newServeCmd(),
+		newUpdateCmd(),
+		newVersionCmd(),
 	)
 
 	return root

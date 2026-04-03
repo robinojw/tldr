@@ -10,6 +10,13 @@ import (
 	"time"
 )
 
+// Version is the current tldr version. Set at build time via:
+//
+//	go build -ldflags "-X github.com/robinojw/tldr/pkg/config.Version=v1.0.0"
+//
+// Defaults to "dev" for local builds.
+var Version = "dev"
+
 // TldrConfig is the top-level tldr configuration.
 type TldrConfig struct {
 	Servers    map[string]*ServerEntry `json:"servers"`

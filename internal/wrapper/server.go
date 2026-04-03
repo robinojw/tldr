@@ -77,7 +77,7 @@ func NewServer(
 
 	s.mcpServer = server.NewMCPServer(
 		"tldr",
-		"0.2.0",
+		config.Version,
 		server.WithToolCapabilities(false),
 		server.WithInstructions(tldrInstructions),
 	)
