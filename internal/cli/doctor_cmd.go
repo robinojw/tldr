@@ -6,28 +6,28 @@ import (
 	"os"
 	"time"
 
-	"github.com/robinwhite/gobbler/internal/compiler"
-	"github.com/robinwhite/gobbler/internal/harness"
-	"github.com/robinwhite/gobbler/internal/mcpclient"
-	"github.com/robinwhite/gobbler/internal/registry"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/compiler"
+	"github.com/robinojw/tldr/internal/harness"
+	"github.com/robinojw/tldr/internal/mcpclient"
+	"github.com/robinojw/tldr/internal/registry"
+	"github.com/robinojw/tldr/pkg/config"
 	"github.com/spf13/cobra"
 )
 
 func newDoctorCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
-		Short: "Validate gobbler installation and connectivity",
+		Short: "Validate tldr installation and connectivity",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			issues := 0
 
-			fmt.Println("Gobbler Doctor")
+			fmt.Println("Tldr Doctor")
 			fmt.Println("==============")
 			fmt.Println()
 
 			// Check config directory
-			dir := config.GobblerDir()
+			dir := config.TldrDir()
 			if _, err := os.Stat(dir); err != nil {
 				fmt.Printf("[WARN] Config directory not found: %s\n", dir)
 				issues++
@@ -98,12 +98,12 @@ func newDoctorCmd() *cobra.Command {
 				fmt.Println("Capability Indexes:")
 				wrapped := reg.WrappedServers()
 				if len(wrapped) == 0 {
-					fmt.Println("  [INFO] No servers wrapped yet (run 'gobbler wrap <server>')")
+					fmt.Println("  [INFO] No servers wrapped yet (run 'tldr wrap <server>')")
 				}
 				for _, s := range wrapped {
 					idx, err := compiler.Load(s.Name)
 					if err != nil {
-						fmt.Printf("  [WARN] %s: no capability index (run 'gobbler wrap %s')\n", s.Name, s.Name)
+						fmt.Printf("  [WARN] %s: no capability index (run 'tldr wrap %s')\n", s.Name, s.Name)
 						issues++
 					} else {
 						fmt.Printf("  [OK]   %s: %d capabilities indexed", s.Name, len(idx.Capabilities))
@@ -127,13 +127,13 @@ func newDoctorCmd() *cobra.Command {
 				path, _ := a.ConfigPath(ctx)
 				fmt.Printf("  [OK]   %s (config: %s)\n", a.Name(), path)
 
-				// Check if gobbler is installed in this harness
+				// Check if tldr is installed in this harness
 				cfg, err := a.LoadConfig(ctx)
 				if err == nil {
-					if _, hasGobbler := cfg.MCPServers["gobbler"]; hasGobbler {
-						fmt.Printf("         - gobbler is installed\n")
+					if _, hasTldr := cfg.MCPServers["tldr"]; hasTldr {
+						fmt.Printf("         - tldr is installed\n")
 					} else {
-						fmt.Printf("         - gobbler NOT installed (run 'gobbler install --harness %s')\n", a.Name())
+						fmt.Printf("         - tldr NOT installed (run 'tldr install --harness %s')\n", a.Name())
 					}
 				}
 			}

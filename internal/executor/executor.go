@@ -17,10 +17,10 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/robinwhite/gobbler/internal/compiler"
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/internal/policy"
-	"github.com/robinwhite/gobbler/internal/resultstore"
+	"github.com/robinojw/tldr/internal/compiler"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/internal/policy"
+	"github.com/robinojw/tldr/internal/resultstore"
 )
 
 var log = logging.New("executor")

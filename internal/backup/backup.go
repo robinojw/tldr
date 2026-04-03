@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 var log = logging.New("backup")

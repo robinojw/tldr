@@ -1,5 +1,5 @@
 // Package compiler inspects upstream MCP tool schemas and builds a
-// compressed capability index for gobbler's search_tools functionality.
+// compressed capability index for tldr's search_tools functionality.
 package compiler
 
 import (
@@ -12,9 +12,9 @@ import (
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/pkg/config"
-	"github.com/robinwhite/gobbler/pkg/protocol"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/pkg/config"
+	"github.com/robinojw/tldr/pkg/protocol"
 )
 
 // Capability is a compressed representation of an upstream MCP tool.
@@ -43,7 +43,7 @@ type Stats struct {
 	ReadOnly      int    `json:"readOnly"`
 	Mutating      int    `json:"mutating"`
 	SchemaTokens  int    `json:"schemaTokens"`  // approximate token count of raw schemas
-	WrappedTokens int    `json:"wrappedTokens"` // approximate token count via gobbler
+	WrappedTokens int    `json:"wrappedTokens"` // approximate token count via tldr
 }
 
 var log = logging.New("compiler")

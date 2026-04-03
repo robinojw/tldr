@@ -1,5 +1,5 @@
 # Binaries
-gobbler
+tldr
 *.exe
 *.dll
 *.so

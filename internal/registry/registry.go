@@ -1,4 +1,4 @@
-// Package registry manages gobbler's server registry -- the source of truth
+// Package registry manages tldr's server registry -- the source of truth
 // for which upstream MCP servers are known, their configuration, and state.
 package registry
 
@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 var log = logging.New("registry")
@@ -17,16 +17,16 @@ var log = logging.New("registry")
 // Registry manages the set of known upstream MCP servers.
 type Registry struct {
 	mu   sync.RWMutex
-	cfg  *config.GobblerConfig
+	cfg  *config.TldrConfig
 	path string
 }
 
-// Open loads or creates the gobbler registry.
+// Open loads or creates the tldr registry.
 func Open() (*Registry, error) {
 	path := config.ServersPath()
 	r := &Registry{path: path}
 
-	cfg := config.NewGobblerConfig()
+	cfg := config.NewTldrConfig()
 	if _, err := os.Stat(path); err == nil {
 		if err := config.LoadJSON(path, cfg); err != nil {
 			return nil, fmt.Errorf("failed to load registry: %w", err)
@@ -169,7 +169,7 @@ func (r *Registry) Policy() *config.PolicyConfig {
 }
 
 // Config returns the full config (read-only snapshot).
-func (r *Registry) Config() *config.GobblerConfig {
+func (r *Registry) Config() *config.TldrConfig {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.cfg

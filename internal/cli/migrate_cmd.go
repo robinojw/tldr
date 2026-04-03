@@ -5,11 +5,11 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/robinwhite/gobbler/internal/backup"
-	"github.com/robinwhite/gobbler/internal/harness"
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/internal/registry"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/backup"
+	"github.com/robinojw/tldr/internal/harness"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/internal/registry"
+	"github.com/robinojw/tldr/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -23,16 +23,16 @@ func newMigrateCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "migrate",
-		Short: "Migrate existing MCP servers from a harness into gobbler (one-shot)",
-		Long: `Read all MCP servers from a harness config, import each one into gobbler's
+		Short: "Migrate existing MCP servers from a harness into tldr (one-shot)",
+		Long: `Read all MCP servers from a harness config, import each one into tldr's
 registry, build capability indexes, then rewrite the harness config so it
-points only at gobbler. The original config is backed up before any changes.
+points only at tldr. The original config is backed up before any changes.
 
-If no --harness flag is given, gobbler detects all installed harnesses and
+If no --harness flag is given, tldr detects all installed harnesses and
 migrates from every one it finds.
 
 This is the fastest way to get started: one command replaces your entire
-MCP setup with gobbler's compressed surface.`,
+MCP setup with tldr's compressed surface.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			adapters := AllAdapters()
@@ -79,17 +79,17 @@ MCP setup with gobbler's compressed surface.`,
 					continue
 				}
 
-				// Skip if the only entry is already gobbler
+				// Skip if the only entry is already tldr
 				if len(cfg.MCPServers) == 1 {
-					if _, exists := cfg.MCPServers["gobbler"]; exists {
-						fmt.Println("  Already migrated (only gobbler entry present).")
+					if _, exists := cfg.MCPServers["tldr"]; exists {
+						fmt.Println("  Already migrated (only tldr entry present).")
 						continue
 					}
 				}
 
 				imported := 0
 				for name, server := range cfg.MCPServers {
-					if name == "gobbler" {
+					if name == "tldr" {
 						continue
 					}
 
@@ -112,7 +112,7 @@ MCP setup with gobbler's compressed surface.`,
 				}
 
 				if dryRun {
-					fmt.Printf("  Would import %d servers, then replace harness config with gobbler entry.\n", imported)
+					fmt.Printf("  Would import %d servers, then replace harness config with tldr entry.\n", imported)
 					continue
 				}
 
@@ -125,28 +125,28 @@ MCP setup with gobbler's compressed surface.`,
 					migrateLog.Warn("failed to backup %s: %v", path, backupErr)
 				}
 
-				// Rewrite harness config: only gobbler
+				// Rewrite harness config: only tldr
 				newCfg := &config.HarnessMCPConfig{
 					MCPServers: map[string]*config.HarnessMCPServer{
-						"gobbler": harness.GobblerServerEntry(),
+						"tldr": harness.TldrServerEntry(),
 					},
 				}
 				if err := adapter.SaveConfig(ctx, newCfg); err != nil {
 					fmt.Printf("  Failed to rewrite config: %v\n", err)
-					fmt.Println("  Your original servers are imported into gobbler but the harness config was not updated.")
-					fmt.Println("  Run 'gobbler install --harness " + adapter.Name() + "' to complete the migration.")
+					fmt.Println("  Your original servers are imported into tldr but the harness config was not updated.")
+					fmt.Println("  Run 'tldr install --harness " + adapter.Name() + "' to complete the migration.")
 					continue
 				}
 
 				_ = adapter.Reload(ctx)
 
 				totalImported += imported
-				fmt.Printf("  Migrated %d servers. Harness config now points only at gobbler.\n", imported)
+				fmt.Printf("  Migrated %d servers. Harness config now points only at tldr.\n", imported)
 
 				// Record wrapper
 				serverNames := make([]string, 0)
 				for name := range cfg.MCPServers {
-					if name != "gobbler" {
+					if name != "tldr" {
 						serverNames = append(serverNames, name)
 					}
 				}
@@ -164,8 +164,8 @@ MCP setup with gobbler's compressed surface.`,
 
 			if totalImported > 0 {
 				fmt.Printf("\nDone. Imported %d servers total.\n", totalImported)
-				fmt.Println("Run 'gobbler mcp list' to see them.")
-				fmt.Println("Run 'gobbler rollback --harness <name>' to undo any harness.")
+				fmt.Println("Run 'tldr mcp list' to see them.")
+				fmt.Println("Run 'tldr rollback --harness <name>' to undo any harness.")
 			}
 			return nil
 		},
@@ -177,7 +177,7 @@ MCP setup with gobbler's compressed surface.`,
 	return cmd
 }
 
-// convertHarnessEntry turns a harness MCP server config into a gobbler ServerEntry.
+// convertHarnessEntry turns a harness MCP server config into a tldr ServerEntry.
 func convertHarnessEntry(name string, h *config.HarnessMCPServer) *config.ServerEntry {
 	entry := &config.ServerEntry{
 		Name:    name,

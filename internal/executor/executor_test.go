@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/robinwhite/gobbler/internal/policy"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/policy"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 // mockCaller is a test implementation of ToolCaller.

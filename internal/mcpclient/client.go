@@ -1,6 +1,6 @@
 // Package mcpclient provides MCP client connectivity to upstream servers.
 // It supports stdio and HTTP transports, wrapping the mcp-go library with
-// gobbler-specific error handling and logging.
+// tldr-specific error handling and logging.
 package mcpclient
 
 import (
@@ -13,8 +13,8 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 // Client wraps mcp-go's Client for upstream MCP server communication.
@@ -81,7 +81,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{
-		Name:    "gobbler",
+		Name:    "tldr",
 		Version: "0.1.0",
 	}
 	initReq.Params.Capabilities = mcp.ClientCapabilities{}

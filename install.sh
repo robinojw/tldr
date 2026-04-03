@@ -1,16 +1,16 @@
 #!/bin/sh
-# gobbler installer
-# Usage: curl -sSfL https://raw.githubusercontent.com/robinojw/gobbler/main/install.sh | sh
+# tldr installer
+# Usage: curl -sSfL https://raw.githubusercontent.com/robinojw/tldr/main/install.sh | sh
 #
-# Installs the gobbler binary to /usr/local/bin (or $GOBBLER_INSTALL_DIR).
+# Installs the tldr binary to /usr/local/bin (or $TLDR_INSTALL_DIR).
 # Requires: curl or wget, tar, uname
 
 set -e
 
-REPO="robinojw/gobbler"
-BINARY="gobbler"
+REPO="robinojw/tldr"
+BINARY="tldr"
 DEFAULT_INSTALL_DIR="/usr/local/bin"
-INSTALL_DIR="${GOBBLER_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+INSTALL_DIR="${TLDR_INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
 
 # Colors (if terminal supports them)
 RED='\033[0;31m'
@@ -18,9 +18,9 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-info() { printf "${GREEN}[gobbler]${NC} %s\n" "$1"; }
-warn() { printf "${YELLOW}[gobbler]${NC} %s\n" "$1"; }
-fail() { printf "${RED}[gobbler]${NC} %s\n" "$1"; exit 1; }
+info() { printf "${GREEN}[tldr]${NC} %s\n" "$1"; }
+warn() { printf "${YELLOW}[tldr]${NC} %s\n" "$1"; }
+fail() { printf "${RED}[tldr]${NC} %s\n" "$1"; exit 1; }
 
 detect_os() {
     case "$(uname -s)" in
@@ -68,7 +68,7 @@ main() {
 
     info "Detected platform: ${OS}/${ARCH}"
 
-    VERSION="${GOBBLER_VERSION:-}"
+    VERSION="${TLDR_VERSION:-}"
     if [ -z "$VERSION" ]; then
         info "Fetching latest release..."
         VERSION="$(latest_version)"
@@ -81,7 +81,7 @@ main() {
         return
     fi
 
-    info "Installing gobbler ${VERSION}"
+    info "Installing tldr ${VERSION}"
 
     # Strip leading v for filename
     VERSION_NUM="${VERSION#v}"
@@ -122,15 +122,15 @@ build_from_source() {
 
     if command -v git >/dev/null 2>&1; then
         info "Cloning repository..."
-        git clone --depth 1 "https://github.com/${REPO}.git" "${TMPDIR}/gobbler" 2>/dev/null
+        git clone --depth 1 "https://github.com/${REPO}.git" "${TMPDIR}/tldr" 2>/dev/null
         (
-            cd "${TMPDIR}/gobbler"
-            go build -o "${TMPDIR}/${BINARY}" ./cmd/gobbler
+            cd "${TMPDIR}/tldr"
+            go build -o "${TMPDIR}/${BINARY}" ./cmd/tldr
         )
     else
         # go install fallback
         info "Installing via go install..."
-        GOBIN="${TMPDIR}" go install "github.com/${REPO}/cmd/gobbler@latest"
+        GOBIN="${TMPDIR}" go install "github.com/${REPO./cmd/tldr@latest"
     fi
 
     if [ ! -f "${TMPDIR}/${BINARY}" ]; then
@@ -165,12 +165,12 @@ install_binary() {
 
     info ""
     info "Get started:"
-    info "  gobbler migrate                        # pull existing MCPs from your harnesses into gobbler"
-    info "  gobbler mcp list                       # see what's registered"
-    info "  gobbler serve                           # run the MCP gateway"
+    info "  tldr migrate                        # pull existing MCPs from your harnesses into tldr"
+    info "  tldr mcp list                       # see what's registered"
+    info "  tldr serve                           # run the MCP gateway"
     info ""
     info "Or add a server manually:"
-    info "  gobbler mcp add --transport stdio github npx -y @modelcontextprotocol/server-github"
+    info "  tldr mcp add --transport stdio github npx -y @modelcontextprotocol/server-github"
 }
 
 main "$@"

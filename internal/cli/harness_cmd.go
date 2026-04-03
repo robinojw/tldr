@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/robinwhite/gobbler/internal/harness"
+	"github.com/robinojw/tldr/internal/harness"
 	"github.com/spf13/cobra"
 )
 

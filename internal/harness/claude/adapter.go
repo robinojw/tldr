@@ -10,10 +10,10 @@ import (
 	"os/exec"
 	"path/filepath"
 
-	"github.com/robinwhite/gobbler/internal/backup"
-	"github.com/robinwhite/gobbler/internal/harness"
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/backup"
+	"github.com/robinojw/tldr/internal/harness"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 var log = logging.New("harness:claude")
@@ -98,15 +98,15 @@ func (a *Adapter) InstallWrapper(ctx context.Context) error {
 		}
 	}
 
-	// Add gobbler entry
-	cfg.MCPServers["gobbler"] = harness.GobblerServerEntry()
+	// Add tldr entry
+	cfg.MCPServers["tldr"] = harness.TldrServerEntry()
 
 	// Save
 	if err := a.SaveConfig(ctx, cfg); err != nil {
-		return fmt.Errorf("failed to install gobbler in claude config: %w", err)
+		return fmt.Errorf("failed to install tldr in claude config: %w", err)
 	}
 
-	log.Info("installed gobbler wrapper in claude config: %s", path)
+	log.Info("installed tldr wrapper in claude config: %s", path)
 	return nil
 }
 

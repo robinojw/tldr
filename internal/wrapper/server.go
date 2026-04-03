@@ -1,4 +1,4 @@
-// Package wrapper implements the gobbler MCP wrapper server that exposes
+// Package wrapper implements the tldr MCP wrapper server that exposes
 // a small tool surface to coding harnesses while keeping large intermediate
 // responses shielded internally.
 //
@@ -17,18 +17,18 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
-	"github.com/robinwhite/gobbler/internal/compiler"
-	"github.com/robinwhite/gobbler/internal/executor"
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/internal/mcpclient"
-	"github.com/robinwhite/gobbler/internal/policy"
-	"github.com/robinwhite/gobbler/internal/resultstore"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/compiler"
+	"github.com/robinojw/tldr/internal/executor"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/internal/mcpclient"
+	"github.com/robinojw/tldr/internal/policy"
+	"github.com/robinojw/tldr/internal/resultstore"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 var log = logging.New("wrapper")
 
-// Server is the gobbler MCP wrapper server.
+// Server is the tldr MCP wrapper server.
 type Server struct {
 	mcpServer *server.MCPServer
 	index     *compiler.CapabilityIndex
@@ -38,7 +38,7 @@ type Server struct {
 	store     *resultstore.Store
 }
 
-// NewServer creates a new gobbler wrapper MCP server.
+// NewServer creates a new tldr wrapper MCP server.
 // If diskPath is non-empty, results are persisted to disk and survive restarts.
 func NewServer(
 	index *compiler.CapabilityIndex,
@@ -76,10 +76,10 @@ func NewServer(
 	}
 
 	s.mcpServer = server.NewMCPServer(
-		"gobbler",
+		"tldr",
 		"0.2.0",
 		server.WithToolCapabilities(false),
-		server.WithInstructions(gobblerInstructions),
+		server.WithInstructions(tldrInstructions),
 	)
 
 	s.registerTools()
@@ -88,7 +88,7 @@ func NewServer(
 
 // Serve starts the wrapper server on stdio.
 func (s *Server) Serve() error {
-	log.Info("starting gobbler wrapper server on stdio")
+	log.Info("starting tldr wrapper server on stdio")
 	return server.ServeStdio(s.mcpServer)
 }
 
@@ -103,7 +103,7 @@ func (s *Server) registerTools() {
 		mcp.WithDescription(
 			"Search available capabilities across all registered MCP servers. "+
 				"Returns compressed summaries of matching tools without loading full schemas. "+
-				"Use this to discover what gobbler can do before calling execute_plan."),
+				"Use this to discover what tldr can do before calling execute_plan."),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Search query describing the capability you need, e.g. 'list pull requests', 'search web', 'read file'"),
@@ -498,12 +498,12 @@ func joinLines(lines []string) string {
 	return result
 }
 
-const gobblerInstructions = `Gobbler is a local MCP gateway that compresses tool surfaces and shields models from large intermediate API responses.
+const tldrInstructions = `Tldr is a local MCP gateway that compresses tool surfaces and shields models from large intermediate API responses.
 
-Instead of calling many individual MCP tools directly, use gobbler's small surface:
+Instead of calling many individual MCP tools directly, use tldr's small surface:
 
 1. search_tools: Discover what capabilities are available across all registered servers.
-2. execute_plan: Run multi-step plans against upstream tools. Intermediate results stay inside gobbler -- you only see the final output.
+2. execute_plan: Run multi-step plans against upstream tools. Intermediate results stay inside tldr -- you only see the final output.
 3. call_raw: Call a single tool directly (escape hatch, still shielded).
 4. inspect_tool: Get detailed parameter info for a specific tool.
 5. get_result: Page through stored results when responses are truncated.

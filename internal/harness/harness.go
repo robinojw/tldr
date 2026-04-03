@@ -6,7 +6,7 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 // Adapter is the interface each coding harness must implement.
@@ -26,7 +26,7 @@ type Adapter interface {
 	// SaveConfig writes the harness's MCP configuration.
 	SaveConfig(ctx context.Context, cfg *config.HarnessMCPConfig) error
 
-	// InstallWrapper injects gobbler as the single MCP server in the harness.
+	// InstallWrapper injects tldr as the single MCP server in the harness.
 	InstallWrapper(ctx context.Context) error
 
 	// Rollback restores the harness config from the latest backup.
@@ -36,7 +36,7 @@ type Adapter interface {
 	Reload(ctx context.Context) error
 }
 
-// WrapperSpec describes how gobbler should be registered in a harness.
+// WrapperSpec describes how tldr should be registered in a harness.
 type WrapperSpec struct {
 	Name      string
 	Command   string
@@ -44,20 +44,20 @@ type WrapperSpec struct {
 	Transport string
 }
 
-// DefaultWrapperSpec returns the default gobbler wrapper spec.
+// DefaultWrapperSpec returns the default tldr wrapper spec.
 func DefaultWrapperSpec() WrapperSpec {
 	return WrapperSpec{
-		Name:      "gobbler",
-		Command:   "gobbler",
+		Name:      "tldr",
+		Command:   "tldr",
 		Args:      []string{"serve"},
 		Transport: "stdio",
 	}
 }
 
-// GobblerServerEntry returns the harness MCP config entry for gobbler.
-func GobblerServerEntry() *config.HarnessMCPServer {
+// TldrServerEntry returns the harness MCP config entry for tldr.
+func TldrServerEntry() *config.HarnessMCPServer {
 	return &config.HarnessMCPServer{
-		Command: "gobbler",
+		Command: "tldr",
 		Args:    []string{"serve"},
 	}
 }

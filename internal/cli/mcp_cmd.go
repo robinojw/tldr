@@ -4,9 +4,9 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/internal/registry"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/internal/registry"
+	"github.com/robinojw/tldr/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -15,7 +15,7 @@ var mcpLog = logging.New("cli:mcp")
 func newMCPCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "mcp",
-		Short: "Manage upstream MCP servers registered with gobbler",
+		Short: "Manage upstream MCP servers registered with tldr",
 	}
 
 	cmd.AddCommand(
@@ -35,15 +35,15 @@ func newMCPAddCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "add <name> <command-or-url> [args...]",
-		Short: "Register an upstream MCP server with gobbler",
-		Long: `Register an MCP server with gobbler's registry. This replaces the harness-specific
-command (e.g. 'claude mcp add', 'forge mcp import'). Gobbler will manage the server
-and make it available to harnesses through the gobbler wrapper.
+		Short: "Register an upstream MCP server with tldr",
+		Long: `Register an MCP server with tldr's registry. This replaces the harness-specific
+command (e.g. 'claude mcp add', 'forge mcp import'). Tldr will manage the server
+and make it available to harnesses through the tldr wrapper.
 
 Examples:
-  gobbler mcp add --transport http figma-remote-mcp https://mcp.figma.com/mcp
-  gobbler mcp add --transport stdio github-mcp -- npx -y @modelcontextprotocol/server-github
-  gobbler mcp add --transport stdio --env GITHUB_TOKEN=ghp_xxx github npx -- -y @modelcontextprotocol/server-github`,
+  tldr mcp add --transport http figma-remote-mcp https://mcp.figma.com/mcp
+  tldr mcp add --transport stdio github-mcp -- npx -y @modelcontextprotocol/server-github
+  tldr mcp add --transport stdio --env GITHUB_TOKEN=ghp_xxx github npx -- -y @modelcontextprotocol/server-github`,
 		Args: cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
@@ -85,8 +85,8 @@ Examples:
 			}
 
 			fmt.Printf("Registered MCP server: %s (%s)\n", name, transport)
-			fmt.Println("Run 'gobbler wrap " + name + "' to build the capability index.")
-			fmt.Println("Run 'gobbler install --harness <name>' to wire into your coding harness.")
+			fmt.Println("Run 'tldr wrap " + name + "' to build the capability index.")
+			fmt.Println("Run 'tldr install --harness <name>' to wire into your coding harness.")
 			return nil
 		},
 	}
@@ -110,7 +110,7 @@ func newMCPListCmd() *cobra.Command {
 
 			servers := reg.ListServers()
 			if len(servers) == 0 {
-				fmt.Println("No MCP servers registered. Use 'gobbler mcp add' to register one.")
+				fmt.Println("No MCP servers registered. Use 'tldr mcp add' to register one.")
 				return nil
 			}
 
@@ -147,7 +147,7 @@ func newMCPListCmd() *cobra.Command {
 func newMCPRemoveCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "remove <name>",
-		Short: "Remove an MCP server from gobbler's registry",
+		Short: "Remove an MCP server from tldr's registry",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			reg, err := registry.Open()

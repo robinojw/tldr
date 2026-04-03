@@ -1,6 +1,6 @@
 // Package resultstore provides an in-memory store for intermediate tool
 // results during plan execution. This keeps raw API responses inside
-// gobbler rather than forwarding them to the coding harness.
+// tldr rather than forwarding them to the coding harness.
 //
 // Results persist across plans with TTL-based eviction. Each result is
 // addressable by a ref handle (planID:stepID) so the model can page
@@ -8,7 +8,7 @@
 //
 // When a disk path is configured, results are also written to disk and
 // reloaded on startup, surviving process restarts. This matters for
-// stdio-based MCP transports where the harness spawns gobbler per session.
+// stdio-based MCP transports where the harness spawns tldr per session.
 package resultstore
 
 import (

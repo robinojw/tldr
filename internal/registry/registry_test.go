@@ -4,13 +4,13 @@ import (
 	"os"
 	"testing"
 
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 func TestRegistryCRUD(t *testing.T) {
 	// Use a temp dir
 	tmp := t.TempDir()
-	t.Setenv("GOBBLER_CONFIG_DIR", tmp)
+	t.Setenv("TLDR_CONFIG_DIR", tmp)
 
 	reg, err := Open()
 	if err != nil {
@@ -76,7 +76,7 @@ func TestRegistryCRUD(t *testing.T) {
 
 func TestRegistryFileCreated(t *testing.T) {
 	tmp := t.TempDir()
-	t.Setenv("GOBBLER_CONFIG_DIR", tmp)
+	t.Setenv("TLDR_CONFIG_DIR", tmp)
 
 	reg, err := Open()
 	if err != nil {

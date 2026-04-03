@@ -1,4 +1,4 @@
-// Package config defines configuration types for the gobbler registry,
+// Package config defines configuration types for the tldr registry,
 // harness adapters, upstream MCP servers, and output policies.
 package config
 
@@ -10,24 +10,24 @@ import (
 	"time"
 )
 
-// GobblerConfig is the top-level gobbler configuration.
-type GobblerConfig struct {
+// TldrConfig is the top-level tldr configuration.
+type TldrConfig struct {
 	Servers    map[string]*ServerEntry `json:"servers"`
 	Wrappers   map[string]*WrapperEntry `json:"wrappers,omitempty"`
 	Policies   *PolicyConfig            `json:"policies,omitempty"`
 	LastUpdate time.Time                `json:"lastUpdate,omitempty"`
 }
 
-// NewGobblerConfig returns an initialized empty config.
-func NewGobblerConfig() *GobblerConfig {
-	return &GobblerConfig{
+// NewTldrConfig returns an initialized empty config.
+func NewTldrConfig() *TldrConfig {
+	return &TldrConfig{
 		Servers:  make(map[string]*ServerEntry),
 		Wrappers: make(map[string]*WrapperEntry),
 		Policies: DefaultPolicyConfig(),
 	}
 }
 
-// ServerEntry represents a registered upstream MCP server in gobbler's registry.
+// ServerEntry represents a registered upstream MCP server in tldr's registry.
 type ServerEntry struct {
 	Name      string            `json:"name"`
 	Transport TransportType     `json:"transport"`
@@ -38,7 +38,7 @@ type ServerEntry struct {
 	Env       map[string]string `json:"env,omitempty"`       // environment variables
 	Timeout   int               `json:"timeout,omitempty"`   // seconds
 	Disabled  bool              `json:"disabled,omitempty"`
-	Wrapped   bool              `json:"wrapped,omitempty"`   // whether gobbler wraps this
+	Wrapped   bool              `json:"wrapped,omitempty"`   // whether tldr wraps this
 	Harnesses []string          `json:"harnesses,omitempty"` // which harnesses see this
 	AddedAt   time.Time         `json:"addedAt,omitempty"`
 }
@@ -52,7 +52,7 @@ const (
 	TransportSSE   TransportType = "sse"
 )
 
-// WrapperEntry tracks a gobbler wrapper installation for a harness.
+// WrapperEntry tracks a tldr wrapper installation for a harness.
 type WrapperEntry struct {
 	Harness    string    `json:"harness"`
 	Servers    []string  `json:"servers"`   // upstream server names routed through this wrapper
@@ -108,46 +108,46 @@ type HarnessMCPServer struct {
 	Disable   bool              `json:"disable,omitempty"`
 }
 
-// GobblerDir returns the path to the gobbler config directory.
-func GobblerDir() string {
-	if dir := os.Getenv("GOBBLER_CONFIG_DIR"); dir != "" {
+// TldrDir returns the path to the tldr config directory.
+func TldrDir() string {
+	if dir := os.Getenv("TLDR_CONFIG_DIR"); dir != "" {
 		return dir
 	}
 	home, _ := os.UserHomeDir()
 	switch runtime.GOOS {
 	case "darwin":
-		return filepath.Join(home, "Library", "Application Support", "gobbler")
+		return filepath.Join(home, "Library", "Application Support", "tldr")
 	case "windows":
 		if appData := os.Getenv("APPDATA"); appData != "" {
-			return filepath.Join(appData, "gobbler")
+			return filepath.Join(appData, "tldr")
 		}
-		return filepath.Join(home, "gobbler")
+		return filepath.Join(home, "tldr")
 	default: // linux, etc.
 		if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
-			return filepath.Join(xdg, "gobbler")
+			return filepath.Join(xdg, "tldr")
 		}
-		return filepath.Join(home, ".config", "gobbler")
+		return filepath.Join(home, ".config", "tldr")
 	}
 }
 
 // ServersPath returns the path to the servers registry file.
 func ServersPath() string {
-	return filepath.Join(GobblerDir(), "servers.json")
+	return filepath.Join(TldrDir(), "servers.json")
 }
 
 // CapabilitiesDir returns the path to the capabilities index directory.
 func CapabilitiesDir() string {
-	return filepath.Join(GobblerDir(), "capabilities")
+	return filepath.Join(TldrDir(), "capabilities")
 }
 
 // BackupDir returns the path to the backup directory.
 func BackupDir() string {
-	return filepath.Join(GobblerDir(), "backups")
+	return filepath.Join(TldrDir(), "backups")
 }
 
 // LogDir returns the path to the log directory.
 func LogDir() string {
-	return filepath.Join(GobblerDir(), "logs")
+	return filepath.Join(TldrDir(), "logs")
 }
 
 // LoadJSON loads a JSON file into the given target.

@@ -1,4 +1,4 @@
-module github.com/robinwhite/gobbler
+module github.com/robinojw/tldr
 
 go 1.25.4
 

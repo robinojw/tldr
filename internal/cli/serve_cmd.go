@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"path/filepath"
 
-	"github.com/robinwhite/gobbler/internal/compiler"
-	"github.com/robinwhite/gobbler/internal/logging"
-	"github.com/robinwhite/gobbler/internal/mcpclient"
-	"github.com/robinwhite/gobbler/internal/registry"
-	"github.com/robinwhite/gobbler/internal/wrapper"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/compiler"
+	"github.com/robinojw/tldr/internal/logging"
+	"github.com/robinojw/tldr/internal/mcpclient"
+	"github.com/robinojw/tldr/internal/registry"
+	"github.com/robinojw/tldr/internal/wrapper"
+	"github.com/robinojw/tldr/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -19,9 +19,9 @@ func newServeCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Run the gobbler MCP wrapper server (stdio)",
-		Long: `Start the gobbler wrapper MCP server on stdio. This is the command that
-coding harnesses invoke to communicate with gobbler. It exposes the
+		Short: "Run the tldr MCP wrapper server (stdio)",
+		Long: `Start the tldr wrapper MCP server on stdio. This is the command that
+coding harnesses invoke to communicate with tldr. It exposes the
 compressed tool surface (search_tools, execute_plan, call_raw, inspect_tool)
 and internally connects to all registered upstream MCP servers.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -92,7 +92,7 @@ and internally connects to all registered upstream MCP servers.`,
 
 			// Create and start wrapper server
 			policyCfg := reg.Policy()
-			diskPath := filepath.Join(config.GobblerDir(), "results")
+			diskPath := filepath.Join(config.TldrDir(), "results")
 			srv := wrapper.NewServer(merged, clients, policyCfg, diskPath)
 
 			// Clean up clients on exit

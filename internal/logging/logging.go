@@ -1,4 +1,4 @@
-// Package logging provides structured stderr logging for gobbler.
+// Package logging provides structured stderr logging for tldr.
 // All log output goes to stderr to avoid corrupting stdio MCP JSON-RPC traffic.
 package logging
 

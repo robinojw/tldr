@@ -1,5 +1,5 @@
-// Package protocol provides MCP protocol types used throughout gobbler.
-// It re-exports key types from mcp-go and defines additional gobbler-specific types.
+// Package protocol provides MCP protocol types used throughout tldr.
+// It re-exports key types from mcp-go and defines additional tldr-specific types.
 package protocol
 
 import (
@@ -21,7 +21,7 @@ type (
 	ListToolsResult   = mcp.ListToolsResult
 )
 
-// ToolSchema is a parsed, gobbler-friendly representation of an MCP tool definition.
+// ToolSchema is a parsed, tldr-friendly representation of an MCP tool definition.
 type ToolSchema struct {
 	Name        string            `json:"name"`
 	Description string            `json:"description"`
@@ -46,7 +46,7 @@ type ParameterSchema struct {
 	Required    bool   `json:"required"`
 }
 
-// ParseToolSchema converts an mcp.Tool into a gobbler ToolSchema.
+// ParseToolSchema converts an mcp.Tool into a tldr ToolSchema.
 func ParseToolSchema(t mcp.Tool) ToolSchema {
 	ts := ToolSchema{
 		Name:        t.Name,

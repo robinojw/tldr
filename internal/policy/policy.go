@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/robinwhite/gobbler/internal/resultstore"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/resultstore"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 // Enforcer applies output policies to tool results before returning them

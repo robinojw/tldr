@@ -1,11 +1,11 @@
-// Package cli implements all gobbler CLI commands using cobra.
+// Package cli implements all tldr CLI commands using cobra.
 package cli
 
 import (
-	"github.com/robinwhite/gobbler/internal/harness"
-	"github.com/robinwhite/gobbler/internal/harness/claude"
-	"github.com/robinwhite/gobbler/internal/harness/codex"
-	"github.com/robinwhite/gobbler/internal/harness/forge"
+	"github.com/robinojw/tldr/internal/harness"
+	"github.com/robinojw/tldr/internal/harness/claude"
+	"github.com/robinojw/tldr/internal/harness/codex"
+	"github.com/robinojw/tldr/internal/harness/forge"
 	"github.com/spf13/cobra"
 )
 
@@ -18,17 +18,17 @@ func AllAdapters() []harness.Adapter {
 	}
 }
 
-// NewRootCmd creates the root gobbler CLI command.
+// NewRootCmd creates the root tldr CLI command.
 func NewRootCmd() *cobra.Command {
 	root := &cobra.Command{
-		Use:   "gobbler",
+		Use:   "tldr",
 		Short: "A local MCP gateway that compresses tool surfaces and shields models from large API responses",
-		Long: `Gobbler is a local MCP gateway for coding harnesses that reduces token usage
+		Long: `Tldr is a local MCP gateway for coding harnesses that reduces token usage
 by replacing many upstream MCP tools with a small wrapper surface and prevents
 large intermediate API responses from reaching the model.
 
 Instead of exposing dozens of MCP tools directly to your coding harness (Claude Code,
-ForgeCode, Codex), gobbler sits in between and provides 5 tools:
+ForgeCode, Codex), tldr sits in between and provides 5 tools:
   - search_tools: discover capabilities across all registered servers
   - execute_plan: run multi-step plans with response shielding  
   - call_raw: direct tool calls (escape hatch)

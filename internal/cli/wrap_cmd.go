@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/robinwhite/gobbler/internal/compiler"
-	"github.com/robinwhite/gobbler/internal/mcpclient"
-	"github.com/robinwhite/gobbler/internal/registry"
+	"github.com/robinojw/tldr/internal/compiler"
+	"github.com/robinojw/tldr/internal/mcpclient"
+	"github.com/robinojw/tldr/internal/registry"
 	"github.com/spf13/cobra"
 )
 
@@ -15,7 +15,7 @@ func newWrapCmd() *cobra.Command {
 		Use:   "wrap <server...>",
 		Short: "Build capability index for upstream MCP servers",
 		Long: `Connect to the specified upstream MCP servers, introspect their tools,
-and build gobbler's compressed capability index. This index is what powers
+and build tldr's compressed capability index. This index is what powers
 the search_tools command in the wrapper.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -78,7 +78,7 @@ the search_tools command in the wrapper.`,
 				)
 			}
 
-			fmt.Println("\nRun 'gobbler install --harness <name>' to wire into your coding harness.")
+			fmt.Println("\nRun 'tldr install --harness <name>' to wire into your coding harness.")
 			return nil
 		},
 	}

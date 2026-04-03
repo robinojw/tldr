@@ -4,9 +4,9 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/robinwhite/gobbler/internal/harness"
-	"github.com/robinwhite/gobbler/internal/registry"
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/internal/harness"
+	"github.com/robinojw/tldr/internal/registry"
+	"github.com/robinojw/tldr/pkg/config"
 	"github.com/spf13/cobra"
 )
 
@@ -15,9 +15,9 @@ func newInstallCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "install",
-		Short: "Install gobbler wrapper into a coding harness",
-		Long: `Inject gobbler as the MCP server in the specified harness's configuration.
-The harness will only see gobbler's 4 tools (search_tools, execute_plan,
+		Short: "Install tldr wrapper into a coding harness",
+		Long: `Inject tldr as the MCP server in the specified harness's configuration.
+The harness will only see tldr's 4 tools (search_tools, execute_plan,
 call_raw, inspect_tool) instead of all the raw upstream MCP tools.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
@@ -57,9 +57,9 @@ call_raw, inspect_tool) instead of all the raw upstream MCP tools.`,
 				})
 			}
 
-			fmt.Printf("Gobbler installed in %s.\n", harnessName)
-			fmt.Println("The harness now sees only gobbler's compressed tool surface.")
-			fmt.Println("Use 'gobbler rollback --harness " + harnessName + "' to undo.")
+			fmt.Printf("Tldr installed in %s.\n", harnessName)
+			fmt.Println("The harness now sees only tldr's compressed tool surface.")
+			fmt.Println("Use 'tldr rollback --harness " + harnessName + "' to undo.")
 			return nil
 		},
 	}
@@ -75,7 +75,7 @@ func newRollbackCmd() *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "rollback",
-		Short: "Restore the harness config from before gobbler installation",
+		Short: "Restore the harness config from before tldr installation",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			adapters := AllAdapters()
@@ -89,7 +89,7 @@ func newRollbackCmd() *cobra.Command {
 				return fmt.Errorf("rollback failed: %w", err)
 			}
 
-			fmt.Printf("Rolled back %s config to pre-gobbler state.\n", harnessName)
+			fmt.Printf("Rolled back %s config to pre-tldr state.\n", harnessName)
 			return nil
 		},
 	}

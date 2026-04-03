@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/robinwhite/gobbler/pkg/config"
+	"github.com/robinojw/tldr/pkg/config"
 )
 
 func TestShield_SmallOutput(t *testing.T) {
