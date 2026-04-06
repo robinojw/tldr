@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sync"
 
 	"github.com/robinojw/tldr/internal/compiler"
 	"github.com/robinojw/tldr/internal/logging"
@@ -26,7 +27,7 @@ compressed tool surface (search_tools, execute_plan, call_raw, inspect_tool)
 and internally connects to all registered upstream MCP servers.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if verbose {
-				logging.Default().SetLevel(logging.LevelDebug)
+				logging.SetGlobalLevel(logging.LevelDebug)
 			}
 
 			ctx := context.Background()
@@ -37,54 +38,86 @@ and internally connects to all registered upstream MCP servers.`,
 				return fmt.Errorf("failed to open registry: %w", err)
 			}
 
-			// Connect to all wrapped servers
+			// Connect to all wrapped servers in parallel.
+			// Each server connects in its own goroutine so a slow or
+			// unreachable server doesn't block the others.
 			servers := reg.WrappedServers()
-			clients := make(map[string]*mcpclient.Client)
-			var indexes []*compiler.CapabilityIndex
+
+			type connResult struct {
+				name   string
+				client *mcpclient.Client
+				index  *compiler.CapabilityIndex
+			}
+
+			var (
+				mu      sync.Mutex
+				wg      sync.WaitGroup
+				results []connResult
+			)
 
 			for _, s := range servers {
-				// Try to load cached capability index
-				idx, err := compiler.Load(s.Name)
-				if err != nil {
-					// Need to introspect
+				wg.Add(1)
+				go func(s *config.ServerEntry) {
+					defer wg.Done()
+
+					// Try to load cached capability index
+					idx, err := compiler.Load(s.Name)
+					if err != nil {
+						// No cache -- need to introspect
+						client, err := mcpclient.NewClient(s)
+						if err != nil {
+							logging.Default().Warn("skipping %s: %v", s.Name, err)
+							return
+						}
+
+						if err := client.Connect(ctx); err != nil {
+							logging.Default().Warn("skipping %s: %v", s.Name, err)
+							client.Close()
+							return
+						}
+
+						tools, err := client.ListTools(ctx)
+						if err != nil {
+							logging.Default().Warn("skipping %s: %v", s.Name, err)
+							client.Close()
+							return
+						}
+
+						idx = compiler.Compile(s.Name, tools)
+						_ = idx.Save(s.Name)
+
+						mu.Lock()
+						results = append(results, connResult{s.Name, client, idx})
+						mu.Unlock()
+						return
+					}
+
+					// Cache hit -- still need to connect for tool calls
 					client, err := mcpclient.NewClient(s)
 					if err != nil {
 						logging.Default().Warn("skipping %s: %v", s.Name, err)
-						continue
-					}
-
-					if err := client.Connect(ctx); err != nil {
-						logging.Default().Warn("skipping %s: %v", s.Name, err)
-						client.Close()
-						continue
-					}
-
-					tools, err := client.ListTools(ctx)
-					if err != nil {
-						logging.Default().Warn("skipping %s: %v", s.Name, err)
-						client.Close()
-						continue
-					}
-
-					idx = compiler.Compile(s.Name, tools)
-					_ = idx.Save(s.Name)
-					clients[s.Name] = client
-				} else {
-					// Still need to connect for tool calls
-					client, err := mcpclient.NewClient(s)
-					if err != nil {
-						logging.Default().Warn("skipping %s: %v", s.Name, err)
-						continue
+						return
 					}
 					if err := client.Connect(ctx); err != nil {
 						logging.Default().Warn("skipping %s: %v", s.Name, err)
 						client.Close()
-						continue
+						return
 					}
-					clients[s.Name] = client
-				}
 
-				indexes = append(indexes, idx)
+					mu.Lock()
+					results = append(results, connResult{s.Name, client, idx})
+					mu.Unlock()
+				}(s)
+			}
+
+			wg.Wait()
+
+			// Collect clients and indexes from parallel results
+			clients := make(map[string]*mcpclient.Client, len(results))
+			indexes := make([]*compiler.CapabilityIndex, 0, len(results))
+			for _, r := range results {
+				clients[r.name] = r.client
+				indexes = append(indexes, r.index)
 			}
 
 			// Merge all indexes

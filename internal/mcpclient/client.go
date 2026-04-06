@@ -86,7 +86,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	initReq.Params.Capabilities = mcp.ClientCapabilities{}
 
-	timeout := 30 * time.Second
+	// Use a shorter default timeout for HTTP transports (which should
+	// respond quickly) and a longer one for stdio (which may need to
+	// spawn a child process).
+	timeout := 15 * time.Second
+	if c.Entry.Transport == config.TransportStdio {
+		timeout = 30 * time.Second
+	}
 	if c.Entry.Timeout > 0 {
 		timeout = time.Duration(c.Entry.Timeout) * time.Second
 	}
@@ -94,6 +100,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	initCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	c.log.Info("connecting (%s, timeout %s)...", c.Entry.Transport, timeout)
 	result, err := c.mcpClient.Initialize(initCtx, initReq)
 	if err != nil {
 		return fmt.Errorf("failed to initialize %s: %w", c.Name, err)

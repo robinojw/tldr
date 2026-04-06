@@ -1,5 +1,9 @@
 // Package logging provides structured stderr logging for tldr.
 // All log output goes to stderr to avoid corrupting stdio MCP JSON-RPC traffic.
+//
+// Use SetGlobalLevel to change the level for all loggers (including those
+// already created via New). Individual loggers can still override with
+// SetLevel.
 package logging
 
 import (
@@ -7,6 +11,7 @@ import (
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -35,12 +40,27 @@ func (l Level) String() string {
 	}
 }
 
+// globalLevel is the process-wide minimum log level. Loggers that have not
+// had SetLevel called explicitly will use this value.
+var globalLevel atomic.Int32
+
+func init() {
+	globalLevel.Store(int32(LevelInfo))
+}
+
+// SetGlobalLevel sets the minimum log level for all loggers that have not
+// overridden their level with SetLevel.
+func SetGlobalLevel(level Level) {
+	globalLevel.Store(int32(level))
+}
+
 // Logger provides structured logging to stderr.
 type Logger struct {
-	mu     sync.Mutex
-	out    io.Writer
-	level  Level
-	prefix string
+	mu            sync.Mutex
+	out           io.Writer
+	level         Level
+	levelOverride bool // true if SetLevel was called explicitly
+	prefix        string
 }
 
 var defaultLogger = &Logger{
@@ -54,6 +74,7 @@ func Default() *Logger {
 }
 
 // New creates a new logger with the given prefix.
+// The logger inherits the global log level until SetLevel is called.
 func New(prefix string) *Logger {
 	return &Logger{
 		out:    os.Stderr,
@@ -62,11 +83,13 @@ func New(prefix string) *Logger {
 	}
 }
 
-// SetLevel sets the minimum log level.
+// SetLevel sets the minimum log level for this logger, overriding the
+// global level.
 func (l *Logger) SetLevel(level Level) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.level = level
+	l.levelOverride = true
 }
 
 // SetOutput sets the log output writer.
@@ -76,13 +99,22 @@ func (l *Logger) SetOutput(w io.Writer) {
 	l.out = w
 }
 
-func (l *Logger) log(level Level, format string, args ...interface{}) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
+// effectiveLevel returns the level to use: the logger's own override, or
+// the global level.
+func (l *Logger) effectiveLevel() Level {
+	if l.levelOverride {
+		return l.level
+	}
+	return Level(globalLevel.Load())
+}
 
-	if level < l.level {
+func (l *Logger) log(level Level, format string, args ...interface{}) {
+	if level < l.effectiveLevel() {
 		return
 	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
 
 	ts := time.Now().Format("15:04:05.000")
 	msg := fmt.Sprintf(format, args...)
